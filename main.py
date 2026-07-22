@@ -1,0 +1,145 @@
+import os
+import sys
+import time
+import signal
+import logging
+from pathlib import Path
+from dotenv import load_dotenv
+
+# 強制抓取 main.py 所在目錄的 .env
+env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
+# 設定 Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+# 讀取採集週期
+raw_interval = os.getenv("POLL_INTERVAL", "5.0").split('#')[0].strip()
+try:
+    POLL_INTERVAL = float(raw_interval)
+except ValueError:
+    logging.warning(f"⚠️ POLL_INTERVAL 讀取失敗 ('{raw_interval}')，改用預設值 5.0 秒")
+    POLL_INTERVAL = 5.0
+
+# 匯入 DB 與 MQTT 模組
+from data_layer.db_connector import DatabaseConnector
+from messaging.mqtt_publisher import MQTTPublisher
+
+# 匯入採集模組
+try:
+    from collector.run_modbus_collector import main as run_modbus_collector
+    from collector.run_s7_collector import collect_s7_data as run_tia_collector
+except ImportError as e:
+    logging.error(f"❌ 匯入採集模組失敗: {e}")
+    sys.exit(1)
+
+# 控制主迴圈運行的旗標
+is_running = True
+
+def signal_handler(sig, frame):
+    global is_running
+    logging.info("🛑 收到終止訊號 (SIGINT/SIGTERM)，正在完成當前採集並準備關閉服務...")
+    is_running = False
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+def fetch_latest_scada_map():
+    """從資料庫一次抓出 Modbus & TIA 最新數值，轉為 MQTT 所需的 Dict 格式"""
+    data_map = {}
+    
+    # 撈 Modbus 點位 (名稱 -> current_value)
+    sql_modbus = "SELECT name, current_value FROM modbus_scada WHERE current_value IS NOT NULL;"
+    # 撈 TIA 點位 (名稱 -> current_data->'val')
+    sql_tia = "SELECT name, (current_data->>'val')::numeric FROM tia_scada WHERE current_data IS NOT NULL;"
+    
+    try:
+        with DatabaseConnector.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_modbus)
+                for row in cur.fetchall():
+                    data_map[row[0]] = float(row[1]) if row[1] is not None else 0.0
+
+                cur.execute(sql_tia)
+                for row in cur.fetchall():
+                    data_map[row[0]] = float(row[1]) if row[1] is not None else 0.0
+    except Exception as e:
+        logging.error(f"❌ 讀取 MQTT 數據來源失敗: {e}")
+        
+    return data_map
+
+
+def main():
+    logging.info("🚀 [IIoT 數據採集與 MQTT 上傳主服務] 啟動中...")
+
+    # 1. 初始化 PostgreSQL 連線池
+    if not DatabaseConnector.initialize_pool():
+        logging.error("❌ PostgreSQL 連線池初始化失敗，主服務無法啟動！")
+        return
+
+    # 2. 初始化 MQTT Publisher
+    mqtt_pub = None
+    try:
+        mqtt_pub = MQTTPublisher()
+    except Exception as e:
+        logging.error(f"⚠️ MQTT 客戶端初始化失敗: {e}")
+
+    logging.info(f"⏱️ 當前設定採集週期: {POLL_INTERVAL} 秒")
+    cycle_count = 0
+
+    try:
+        while is_running:
+            cycle_count += 1
+            start_time = time.time()
+            logging.info(f"\n================ 🔄 第 {cycle_count} 輪採集開始 ================")
+
+            # 步驟 1: 執行 Modbus 採集
+            try:
+                logging.info("📡 [1/3] 正在執行 Modbus 採集...")
+                run_modbus_collector()
+            except Exception as e:
+                logging.error(f"❌ Modbus 採集過程發生例外: {e}")
+
+            # 步驟 2: 執行 TIA (S7) 採集
+            try:
+                logging.info("📡 [2/3] 正在執行 TIA (S7) 採集...")
+                run_tia_collector()
+            except Exception as e:
+                logging.error(f"❌ TIA 採集過程發生例外: {e}")
+
+            # 步驟 3: 抓取 DB 最新點位並進行 MQTT 增量上傳
+            if mqtt_pub:
+                try:
+                    logging.info("📤 [3/3] 正在執行 MQTT 增量上傳...")
+                    current_scada_data = fetch_latest_scada_map()
+                    mqtt_pub.publish_incremental(current_scada_data)
+                except Exception as e:
+                    logging.error(f"❌ MQTT 發送過程發生例外: {e}")
+
+            # 步驟 4: 計算動態休眠時間
+            elapsed_time = time.time() - start_time
+            sleep_time = max(0.0, POLL_INTERVAL - elapsed_time)
+
+            logging.info(f"⏱️ 本輪總耗時: {elapsed_time:.3f} 秒 | 預計休眠: {sleep_time:.3f} 秒")
+
+            # 可即時響應 Ctrl+C 的 Sleep 邏輯
+            sleep_end = time.time() + sleep_time
+            while is_running and time.time() < sleep_end:
+                time.sleep(0.1)
+
+    except Exception as main_err:
+        logging.error(f"💥 主迴圈發生未預期的例外: {main_err}", exc_info=True)
+    finally:
+        # 安全關閉資源
+        if mqtt_pub:
+            mqtt_pub.close()
+        DatabaseConnector.close_pool()
+        logging.info("👋 已安全關閉 MQTT 與 DB 連線池，主程式退出。")
+
+
+if __name__ == "__main__":
+    main()
