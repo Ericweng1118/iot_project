@@ -1,16 +1,27 @@
 import json
+import os
 import struct
 import pandas as pd
 import streamlit as st
+
+# 1. 載入 .env 環境變數
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# 取得帳密設定 (若 .env 未設定則給預設值)
+ADMIN_USER = os.getenv("ADMIN_USER", "eric")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "eric1118")
+
 from data_layer.db_connector import DatabaseConnector
 
-# 1. 相容 Modbus TCP 套件
+# 2. 相容 Modbus TCP 套件
 try:
     from pymodbus.client import ModbusTcpClient
 except ImportError:
     from pymodbus.client.sync import ModbusTcpClient  # type: ignore
 
-# 2. Siemens S7 (snap7) 套件引用
+# 3. Siemens S7 (snap7) 套件引用
 try:
     import snap7
     from snap7.util import (
@@ -25,6 +36,43 @@ try:
     SNAP7_AVAILABLE = True
 except ImportError:
     SNAP7_AVAILABLE = False
+
+
+# ------------------------------------------------------------------
+# Helper: 身份驗證機制 (Login Mechanism)
+# ------------------------------------------------------------------
+def check_password():
+    """驗證使用者登入狀態，若未登入則顯示登入表單並終止後續渲染"""
+    if "logged_in" not in st.session_state:
+        st.session_state["logged_in"] = False
+
+    # 若已登入，傳回 True
+    if st.session_state["logged_in"]:
+        return True
+
+    # 顯示登入畫面
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.subheader("🔒 IIoT 後台系統登入")
+        with st.form("login_form"):
+            username_input = st.text_input("帳號 (Username)")
+            password_input = st.text_input("密碼 (Password)", type="password")
+            submit_login = st.form_submit_button(
+                "登入系統", type="primary", use_container_width=True
+            )
+
+            if submit_login:
+                if (
+                    username_input == ADMIN_USER
+                    and password_input == ADMIN_PASSWORD
+                ):
+                    st.session_state["logged_in"] = True
+                    st.success("✅ 登入成功！")
+                    st.rerun()
+                else:
+                    st.error("❌ 帳號或密碼錯誤，請重新輸入。")
+
+    return False
 
 
 # ------------------------------------------------------------------
@@ -46,9 +94,7 @@ def test_modbus_read(
     eng_max=100.0,
 ):
     dt = data_type.lower()
-    if dt in ["bool"]:
-        count = 1
-    elif dt in ["word", "int", "int16", "uint16"]:
+    if dt in ["bool", "word", "int", "int16", "uint16"]:
         count = 1
     elif dt in ["dint", "int32", "uint32", "float"]:
         count = 2
@@ -59,7 +105,7 @@ def test_modbus_read(
 
     client = ModbusTcpClient(ip, port=int(port), timeout=3)
     if not client.connect():
-        return False, f"❌ 連線失敗：無法連線至 {ip}:{port} (請檢查網路連線或 IP/Port)"
+        return False, f"❌ 連線失敗：無法連線至 {ip}:{port}"
 
     try:
         kwargs = {}
@@ -156,26 +202,15 @@ def test_tia_read(ip, db_number, offset, data_type, rack=0, slot=1):
 
     client = snap7.client.Client()
     try:
-        # S7 連線 (預設 Rack 0, Slot 1 適用於 S7-1200/1500)
         client.connect(ip, int(rack), int(slot))
         if not client.get_connected():
             return False, f"❌ 連線失敗：無法透過 S7 連線至 {ip}"
 
         dt = data_type.upper()
-        # 計算數據 Byte 長度
-        if dt == "BOOL":
-            size = 1
-        elif dt in ["INT", "WORD"]:
-            size = 2
-        elif dt in ["DINT", "REAL", "DWORD"]:
-            size = 4
-        else:
-            size = 2
+        size = 1 if dt == "BOOL" else (2 if dt in ["INT", "WORD"] else 4)
 
-        # 讀取 DB 區塊資料
         db_data = client.db_read(int(db_number), int(offset), size)
 
-        # 解析不同資料型態
         if dt == "BOOL":
             val = get_bool(db_data, 0, 0)
         elif dt == "INT":
@@ -199,7 +234,7 @@ def test_tia_read(ip, db_number, offset, data_type, rack=0, slot=1):
     except Exception as e:
         return (
             False,
-            f"❌ 讀取失敗: {e}\n💡 提示：請確認 TIA Portal 已開啟 PUT/GET 權限且 DB 未啟用「優化區塊存取（Optimized Access）」。",
+            f"❌ 讀取失敗: {e}\n💡 提示：請確認 TIA Portal 已開啟 PUT/GET 權限且 DB 未啟用「優化區塊存取」。",
         )
     finally:
         try:
@@ -209,9 +244,25 @@ def test_tia_read(ip, db_number, offset, data_type, rack=0, slot=1):
 
 
 # ==========================================
-# 主頁面佈局與資料庫初始化
+# 主頁面配置與登入檢查
 # ==========================================
-st.set_page_config(page_title="IIoT SCADA 點位連線參數管理系統", layout="wide")
+st.set_page_config(
+    page_title="IIoT SCADA 點位連線參數管理系統",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# 🔐 執行登入檢查：若未登入則停止執行後續程式碼
+if not check_password():
+    st.stop()
+
+# 側邊欄：顯示登入資訊與登出按鈕
+with st.sidebar:
+    st.write(f"👤 當前登入：`{ADMIN_USER}`")
+    if st.button("🚪 登出系統", use_container_width=True):
+        st.session_state["logged_in"] = False
+        st.rerun()
+
 st.title("⚙️ IIoT 點位與連線參數管理後台")
 
 if not hasattr(st, "db_inited"):
@@ -381,11 +432,11 @@ with tab_modbus:
         btn_col1, btn_col2 = st.columns([1, 1])
         with btn_col1:
             submit_modbus = st.form_submit_button(
-                "新增 Modbus 點位", type="primary", width="stretch"
+                "新增 Modbus 點位", type="primary", use_container_width=True
             )
         with btn_col2:
             test_modbus = st.form_submit_button(
-                "🧪 測試連線與讀取", width="stretch"
+                "🧪 測試連線與讀取", use_container_width=True
             )
 
         if test_modbus:
@@ -544,18 +595,16 @@ with tab_tia:
                 index=3,
             )
 
-        # 按鈕區：並排 [新增 TIA 點位] 與 [🧪 測試連線與讀取]
         btn_col1, btn_col2 = st.columns([1, 1])
         with btn_col1:
             submit_tia = st.form_submit_button(
-                "新增 TIA 點位", type="primary", width="stretch"
+                "新增 TIA 點位", type="primary", use_container_width=True
             )
         with btn_col2:
             test_tia = st.form_submit_button(
-                "🧪 測試連線與讀取", width="stretch"
+                "🧪 測試連線與讀取", use_container_width=True
             )
 
-        # 動作 1：即時連線測試
         if test_tia:
             with st.spinner("📡 正在連線 Siemens PLC 並嘗試讀取 DB 數據..."):
                 ok, msg = test_tia_read(
@@ -566,7 +615,6 @@ with tab_tia:
                 else:
                     st.error(msg)
 
-        # 動作 2：寫入資料庫
         if submit_tia:
             try:
                 with DatabaseConnector.get_connection() as conn:

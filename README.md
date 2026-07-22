@@ -90,6 +90,11 @@ MQTT_TOPIC=iot-2/evt/wadata/fmt/scada_unified  # MQTT 發布主題
 # ==========================================
 # 採集週期 (秒)
 POLL_INTERVAL="60.0"
+
+#網頁小工具入口帳號、密碼、PORT
+ADMIN_USER=user
+ADMIN_PASSWORD=password
+ADMIN_PORT=PORT_NUMBER
 ```
 
 #### 3. 執行主程式
@@ -213,6 +218,14 @@ VALUES
 
 ## 🔧 模組說明
 
+### `collerctor/run_modbus_collector.py`
+
+Modbus的資料擷取主程式
+
+### **`collerctor/run_s7_collector.py`**
+
+TIA_S7的資料擷取主程式
+
 ### `protocols/s7_protocol.py`
 
 西門子 S7 協議封裝，使用 `snap7` 庫讀取 DB 區塊數據。處理位元、字節、字詞的記憶體對齊與解析。
@@ -245,62 +258,12 @@ MQTT 發送器：處理與 MQTT Broker 的連線、認證與發布。支援 QoS 
 
 統一主程式入口。整合 S7 與 Modbus 雙協議，執行輪詢、比對、批量更新與增量上傳流程。
 
----
+### `admin_app.py`
 
-## 📝 自訂開發
+網頁介面小工具，可以修改連線參數，也可以做連線測試，需要帳號密碼。
 
-### 新增支援新的資料型態
+### `run_all.py`
 
-修改對應的 parser/encoder 檔案中的 `struct.pack/unpack` 格式字串：
+統一主程式入口。整合 S7 與 Modbus 雙協議，執行輪詢、比對、批量更新與增量上傳流程跟網頁程式一起開啟。
 
-| 型態         | struct 格式   | 位元數 | 暫存器數量 |
-| ------------ | ------------- | ------ | ---------- |
-| INT16        | `h` / `H` | 16     | 1          |
-| DINT/INT32   | `i` / `I` | 32     | 2          |
-| REAL/FLOAT32 | `f`         | 32     | 2          |
-| INT64        | `q`         | 64     | 4          |
-| FLOAT64      | `d`         | 64     | 4          |
-
-### 新增新的 PLC 協議
-
-1. 在 `protocols/` 目錄下建立新協議模組
-2. 在 `unified_collector.py` 中匯入並註冊對應的讀取函數
-3. 在資料庫中新增相對應的配置表格
-
----
-
-## 🐛 常見問題排除
-
-### 1. `ModuleNotFoundError: No module named 'pymodbus'`
-
-```bash
-pip install -r requirements.txt
-```
-
-### 2. PostgreSQL 連線失敗
-
-檢查 `.env` 中的 `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` 是否正確。
-
-### 3. Modbus 讀取數值異常
-
-嘗試更換 `byte_order` 與 `word_order` 組合，參考上方「常見組合速查表」。
-
-### 4. MQTT 發送失敗
-
-檢查 MQTT Broker IP、Port、帳號密碼是否正確，並確認網路可達。
-
----
-
-## 📄 License
-
-MIT License
-
----
-
-## 🤝 貢獻方式
-
-1. Fork 本專案
-2. 建立功能分支 (`git checkout -b feature/xxx`)
-3. 提交更改 (`git commit -m 'Add xxx'`)
-4. 推送到遠端 (`git push origin feature/xxx`)
-5. 開啟 Pull Request
+-
