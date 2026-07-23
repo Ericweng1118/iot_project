@@ -1,6 +1,6 @@
 # 多功能工業 PLC 資料採集系統 (Unified Industrial Data Collector)
 
-一個支援**西門子 S7** 與 **Modbus TCP** 雙協議的統一工業資料採集系統，具備 PostgreSQL 批量更新與 MQTT 增量上傳功能，MQTT Payload格式為研華RTM平台。
+一個支援**西門子 S7** 與 **Modbus TCP** 雙協議的統一工業資料採集系統，具備 PostgreSQL 批量更新與 MQTT 增量上傳功能。
 
 ---
 

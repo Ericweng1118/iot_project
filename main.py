@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 
 # 讀取採集週期
-raw_interval = os.getenv("POLL_INTERVAL", "5.0").split('#')[0].strip()
+raw_interval = os.getenv("POLL_INTERVAL", "60.0").split('#')[0].strip()
 try:
     POLL_INTERVAL = float(raw_interval)
 except ValueError:
@@ -48,28 +48,54 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+def _safe_parse_val(val):
+    """安全解析點位值：數字自動轉 float/int，中文狀態字串原樣保留"""
+    if val is None:
+        return 0.0
+
+    try:
+        # 嘗試轉成數字
+        num = float(val)
+        # 如果是整數 (例如 25.0)，轉成乾淨的整數 25
+        return int(num) if num.is_integer() else num
+    except (ValueError, TypeError):
+        # 轉型失敗代表這是中文狀態字串 (如 '壓力到達')，直接保留原字串
+        return str(val)
+    
 def fetch_latest_scada_map():
     """從資料庫一次抓出 Modbus & TIA 最新數值，轉為 MQTT 所需的 Dict 格式"""
     data_map = {}
-    
-    # 撈 Modbus 點位 (名稱 -> current_value)
-    sql_modbus = "SELECT name, current_value FROM modbus_scada WHERE current_value IS NOT NULL;"
-    # 撈 TIA 點位 (名稱 -> current_data->'val')
-    sql_tia = "SELECT name, (current_data->>'val')::numeric FROM tia_scada WHERE current_data IS NOT NULL;"
-    
+
+    # 1. 撈 Modbus 點位 (拿掉強轉)
+    sql_modbus = """
+    SELECT name, current_data->>'val' AS current_value 
+    FROM modbus_scada 
+    WHERE current_data IS NOT NULL;
+    """
+
+    # 2. 撈 TIA 點位 (把 ::numeric 拿掉，避免 SQL 轉型失敗)
+    sql_tia = """
+    SELECT name, current_data->>'val' AS current_value 
+    FROM tia_scada 
+    WHERE current_data IS NOT NULL;
+    """
+
     try:
         with DatabaseConnector.get_connection() as conn:
             with conn.cursor() as cur:
+                # 執行 Modbus
                 cur.execute(sql_modbus)
                 for row in cur.fetchall():
-                    data_map[row[0]] = float(row[1]) if row[1] is not None else 0.0
+                    data_map[row[0]] = _safe_parse_val(row[1])
 
+                # 執行 TIA
                 cur.execute(sql_tia)
                 for row in cur.fetchall():
-                    data_map[row[0]] = float(row[1]) if row[1] is not None else 0.0
+                    data_map[row[0]] = _safe_parse_val(row[1])
+
     except Exception as e:
         logging.error(f"❌ 讀取 MQTT 數據來源失敗: {e}")
-        
+
     return data_map
 
 

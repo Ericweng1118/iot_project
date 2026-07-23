@@ -10,8 +10,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # 取得帳密設定 (若 .env 未設定則給預設值)
-ADMIN_USER = os.getenv("ADMIN_USER", "eric")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "eric1118")
+ADMIN_USER = os.getenv("ADMIN_USER", "USER")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "PASSWORD")
 
 from data_layer.db_connector import DatabaseConnector
 
@@ -286,7 +286,7 @@ with tab_modbus:
                     SELECT 
                         id, name, plc_ip, plc_port, slave_id, function_code, start_address, 
                         data_type, raw_min, raw_max, eng_min, eng_max, byte_order, word_order,
-                        state_dictionary, plc_state, current_value, last_update
+                        state_dictionary, plc_state, current_value,current_data, last_update
                     FROM modbus_scada 
                     ORDER BY id ASC;
                     """
@@ -376,8 +376,8 @@ with tab_modbus:
     with st.form("add_modbus_form", clear_on_submit=False):
         col1, col2, col3 = st.columns(3)
         with col1:
-            m_name = st.text_input("點位名稱 (name)", "T3_Temp1")
-            m_plc_ip = st.text_input("PLC IP 地址 (plc_ip)", "192.168.1.100")
+            m_name = st.text_input("點位名稱 (name)", "Test")
+            m_plc_ip = st.text_input("PLC IP 地址 (plc_ip)", "192.168.1.1")
             m_plc_port = st.number_input("Modbus 埠號 (plc_port)", value=502)
             m_slave_id = st.number_input(
                 "從站 ID (slave_id)", value=1, min_value=1, max_value=247
@@ -420,9 +420,9 @@ with tab_modbus:
         with col3:
             m_use_scale = st.checkbox("啟用 Scaling (線性轉換)", value=False)
             m_raw_min = st.number_input("原始最小值 (raw_min)", value=0.0)
-            m_raw_max = st.number_input("原始最大值 (raw_max)", value=4095.0)
+            m_raw_max = st.number_input("原始最大值 (raw_max)", value=10000.0)
             m_eng_min = st.number_input("工程最小值 (eng_min)", value=0.0)
-            m_eng_max = st.number_input("工程最大值 (eng_max)", value=100.0)
+            m_eng_max = st.number_input("工程最大值 (eng_max)", value=1000.0)
             m_state_dict = st.text_input(
                 "狀態字典 JSON (state_dictionary)",
                 value="",
