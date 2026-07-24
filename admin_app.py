@@ -89,9 +89,9 @@ def test_modbus_read(
     word_order,
     use_scale=False,
     raw_min=0.0,
-    raw_max=4095.0,
+    raw_max=10000.0,
     eng_min=0.0,
-    eng_max=100.0,
+    eng_max=10000.0,
 ):
     dt = data_type.lower()
     if dt in ["bool", "word", "int", "int16", "uint16"]:
@@ -152,21 +152,32 @@ def test_modbus_read(
         else:
             return False, f"❌ 不支援的功能碼: {function_code}"
 
+        # -------------------------------------------------------------
+        # 1. 處理 Word Order (字組順序: 高字組與低字組順序)
+        # -------------------------------------------------------------
         if word_order.upper() == "LITTLE" and len(registers) > 1:
             registers = registers[::-1]
 
-        byte_fmt = ">H" if byte_order.upper() == "BIG" else "<H"
-        raw_bytes = b"".join([struct.pack(byte_fmt, r) for r in registers])
+        # -------------------------------------------------------------
+        # 2. 處理 Byte Order (位元組順序: 每個 Register 內部 2 個 Byte 的順序)
+        # -------------------------------------------------------------
+        byte_pack_fmt = ">H" if byte_order.upper() == "BIG" else "<H"
+        raw_bytes = b"".join(
+            [struct.pack(byte_pack_fmt, r) for r in registers]
+        )
 
+        # -------------------------------------------------------------
+        # 3. 統一使用 Big-Endian (>) 進行解包，才能正確反映 Byte Order 轉換結果
+        # -------------------------------------------------------------
         fmt_map = {
-            "word": ">H" if byte_order.upper() == "BIG" else "<H",
-            "int": ">h" if byte_order.upper() == "BIG" else "<h",
-            "uint32": ">I" if byte_order.upper() == "BIG" else "<I",
-            "dint": ">i" if byte_order.upper() == "BIG" else "<i",
-            "float": ">f" if byte_order.upper() == "BIG" else "<f",
-            "uint64": ">Q" if byte_order.upper() == "BIG" else "<Q",
-            "int64": ">q" if byte_order.upper() == "BIG" else "<q",
-            "float64": ">d" if byte_order.upper() == "BIG" else "<d",
+            "word": ">H",
+            "int": ">h",
+            "uint32": ">I",
+            "dint": ">i",
+            "float": ">f",
+            "uint64": ">Q",
+            "int64": ">q",
+            "float64": ">d",
         }
         fmt = fmt_map.get(dt, ">H")
         raw_val = struct.unpack(fmt, raw_bytes)[0]
@@ -174,10 +185,13 @@ def test_modbus_read(
         final_val = raw_val
         scale_info = ""
         if use_scale and (raw_max != raw_min):
-            final_val = eng_min + (raw_val - raw_min) * (eng_max - eng_min) / (
-                raw_max - raw_min
+            final_val = eng_min + (raw_val - raw_min) * (
+                eng_max - eng_min
+            ) / (raw_max - raw_min)
+            scale_info = (
+                f" (Raw 原始值: `{raw_val}`, Scaling 工程值:"
+                f" `{round(final_val, 4)}`)"
             )
-            scale_info = f" (Raw 原始值: `{raw_val}`, Scaling 工程值: `{round(final_val, 4)}`)"
 
         val_display = (
             round(final_val, 4) if isinstance(final_val, float) else final_val
@@ -286,7 +300,7 @@ with tab_modbus:
                     SELECT 
                         id, name, plc_ip, plc_port, slave_id, function_code, start_address, 
                         data_type, raw_min, raw_max, eng_min, eng_max, byte_order, word_order,
-                        state_dictionary, plc_state, current_value,current_data, last_update
+                        state_dictionary, plc_state, current_value,current_data,unit, last_update
                     FROM modbus_scada 
                     ORDER BY id ASC;
                     """
@@ -382,6 +396,7 @@ with tab_modbus:
             m_slave_id = st.number_input(
                 "從站 ID (slave_id)", value=1, min_value=1, max_value=247
             )
+            m_unit = st.text_input("單位 (unit)", "單位")
 
         with col2:
             fc_mapping = {
@@ -473,8 +488,8 @@ with tab_modbus:
                         INSERT INTO modbus_scada (
                             name, plc_ip, plc_port, slave_id, function_code, start_address, 
                             data_type, byte_order, word_order, raw_min, raw_max, eng_min, eng_max, 
-                            state_dictionary, plc_state
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OFFLINE');
+                            state_dictionary,unit, plc_state
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OFFLINE');
                         """
                         cur.execute(
                             sql,
@@ -483,6 +498,7 @@ with tab_modbus:
                                 m_plc_ip,
                                 int(m_plc_port),
                                 int(m_slave_id),
+                                m_unit,
                                 int(m_function_code),
                                 int(m_start_address),
                                 m_data_type,
