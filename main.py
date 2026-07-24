@@ -33,6 +33,7 @@ from messaging.mqtt_publisher import MQTTPublisher
 try:
     from collector.run_modbus_collector import main as run_modbus_collector
     from collector.run_s7_collector import collect_s7_data as run_tia_collector
+    from collector.run_opcua_collector import collect_opcua_data as run_opcua_collector
 except ImportError as e:
     logging.error(f"❌ 匯入採集模組失敗: {e}")
     sys.exit(1)
@@ -63,7 +64,7 @@ def _safe_parse_val(val):
         return str(val)
     
 def fetch_latest_scada_map():
-    """從資料庫一次抓出 Modbus & TIA 最新數值，轉為 MQTT 所需的 Dict 格式"""
+    """從資料庫一次抓出 Modbus & TIA & OPC UA 最新數值，轉為 MQTT 所需的 Dict 格式"""
     data_map = {}
 
     # 1. 撈 Modbus 點位 (拿掉強轉)
@@ -80,6 +81,14 @@ def fetch_latest_scada_map():
     WHERE current_data IS NOT NULL;
     """
 
+    # 3. OPC UA 目前先不併入 MQTT 上傳（測試階段，只採集存 DB）
+    #    之後要打包時，把下面這段 SQL 跟下方的 cur.execute(sql_opcua) 取消註解即可：
+    # sql_opcua = """
+    # SELECT server_name || '_' || browse_name AS name, current_data->>'val' AS current_value
+    # FROM opcua_tags
+    # WHERE current_data IS NOT NULL;
+    # """
+
     try:
         with DatabaseConnector.get_connection() as conn:
             with conn.cursor() as cur:
@@ -92,6 +101,8 @@ def fetch_latest_scada_map():
                 cur.execute(sql_tia)
                 for row in cur.fetchall():
                     data_map[row[0]] = _safe_parse_val(row[1])
+
+                # OPC UA 先不撈（測試階段），詳見上方註解
 
     except Exception as e:
         logging.error(f"❌ 讀取 MQTT 數據來源失敗: {e}")
@@ -125,28 +136,44 @@ def main():
 
             # 步驟 1: 執行 Modbus 採集
             try:
-                logging.info("📡 [1/3] 正在執行 Modbus 採集...")
+                logging.info("📡 [1/4] 正在執行 Modbus 採集...")
                 run_modbus_collector()
             except Exception as e:
                 logging.error(f"❌ Modbus 採集過程發生例外: {e}")
 
             # 步驟 2: 執行 TIA (S7) 採集
             try:
-                logging.info("📡 [2/3] 正在執行 TIA (S7) 採集...")
+                logging.info("📡 [2/4] 正在執行 TIA (S7) 採集...")
                 run_tia_collector()
             except Exception as e:
                 logging.error(f"❌ TIA 採集過程發生例外: {e}")
 
-            # 步驟 3: 抓取 DB 最新點位並進行 MQTT 增量上傳
+            # 步驟 3: 執行 OPC UA 採集
+            # 注意：OPC UA 每輪都要重新瀏覽整個 Address Space，若點位很多、
+            # 週期設定又短，這步可能會拖慢整輪採集時間。如果發現這步耗時
+            # 過長，可以考慮：
+            #   (a) 在 opcua_servers 把 browse_depth 調小、root_node_id 指到
+            #       更精準的節點，縮小每次瀏覽範圍
+            #   (b) 改成獨立的排程週期（例如額外用 OPCUA_POLL_INTERVAL
+            #       另外跑一個迴圈），不要跟 Modbus/TIA 共用同一個 POLL_INTERVAL
+            #   (c) 平常倚賴 admin_app.py 網頁上的「手動瀏覽」按鈕來即時抓取，
+            #       這裡的排程只作為備援全量更新
+            try:
+                logging.info("📡 [3/4] 正在執行 OPC UA 採集...")
+                run_opcua_collector()
+            except Exception as e:
+                logging.error(f"❌ OPC UA 採集過程發生例外: {e}")
+
+            # 步驟 4: 抓取 DB 最新點位並進行 MQTT 增量上傳
             if mqtt_pub:
                 try:
-                    logging.info("📤 [3/3] 正在執行 MQTT 增量上傳...")
+                    logging.info("📤 [4/4] 正在執行 MQTT 增量上傳...")
                     current_scada_data = fetch_latest_scada_map()
                     mqtt_pub.publish_incremental(current_scada_data)
                 except Exception as e:
                     logging.error(f"❌ MQTT 發送過程發生例外: {e}")
 
-            # 步驟 4: 計算動態休眠時間
+            # 步驟 5: 計算動態休眠時間
             elapsed_time = time.time() - start_time
             sleep_time = max(0.0, POLL_INTERVAL - elapsed_time)
 

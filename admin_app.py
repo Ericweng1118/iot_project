@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import struct
@@ -14,6 +15,7 @@ ADMIN_USER = os.getenv("ADMIN_USER", "USER")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "PASSWORD")
 
 from data_layer.db_connector import DatabaseConnector
+from data_layer.batch_updater import batch_update_opcua_tags
 
 # 2. 相容 Modbus TCP 套件
 try:
@@ -36,6 +38,14 @@ try:
     SNAP7_AVAILABLE = True
 except ImportError:
     SNAP7_AVAILABLE = False
+
+# 4. OPC UA (asyncua) 套件引用
+try:
+    from protocols.opcua_protocol import scan_server, OPCUAConnectionError
+
+    OPCUA_AVAILABLE = True
+except ImportError:
+    OPCUA_AVAILABLE = False
 
 
 # ------------------------------------------------------------------
@@ -257,6 +267,18 @@ def test_tia_read(ip, db_number, offset, data_type, rack=0, slot=1):
             pass
 
 
+# ------------------------------------------------------------------
+# Helper 3: OPC UA 相關工具函式
+# ------------------------------------------------------------------
+def run_async(coro):
+    """
+    在 Streamlit 的同步環境中執行 asyncio coroutine。
+    按鈕點下去會同步等待結果回來（畫面轉圈），
+    點位數量多或網路慢時可能需要等待數秒到數十秒。
+    """
+    return asyncio.run(coro)
+
+
 # ==========================================
 # 主頁面配置與登入檢查
 # ==========================================
@@ -283,7 +305,9 @@ if not hasattr(st, "db_inited"):
     DatabaseConnector.initialize_pool()
     st.db_inited = True
 
-tab_modbus, tab_tia = st.tabs(["📡 Modbus 點位設定", "📡 TIA (S7) 點位設定"])
+tab_modbus, tab_tia, tab_opcua = st.tabs(
+    ["📡 Modbus 點位設定", "📡 TIA (S7) 點位設定", "📡 OPC UA 點位設定"]
+)
 
 
 # ==========================================
@@ -655,3 +679,315 @@ with tab_tia:
                 st.rerun()
             except Exception as e:
                 st.error(f"❌ 新增失敗: {e}")
+
+
+# ==========================================
+# Tab 3: OPC UA Server / 點位管理
+# ==========================================
+with tab_opcua:
+    st.header("OPC UA 點位配置")
+
+    if not OPCUA_AVAILABLE:
+        st.error(
+            "❌ 未安裝 `asyncua` 套件！請在 Terminal 執行 `pip install asyncua`，"
+            "並確認 `protocols/opcua_protocol.py` 已放入專案中。"
+        )
+        st.stop()
+
+    # ----------------------------------------------------------
+    # 讀取 opcua_servers 清單
+    # ----------------------------------------------------------
+    def load_opcua_servers():
+        try:
+            with DatabaseConnector.get_connection() as conn:
+                with conn.cursor() as cur:
+                    query = """
+                    SELECT id, server_name, ip, port, username, password,
+                           security_policy, security_mode, root_node_id, browse_depth,
+                           enabled, conn_state, last_scan, last_error
+                    FROM opcua_servers
+                    ORDER BY id ASC;
+                    """
+                    cur.execute(query)
+                    cols = [desc[0] for desc in cur.description]
+                    rows = cur.fetchall()
+                    return pd.DataFrame(rows, columns=cols)
+        except Exception as e:
+            st.error(f"無法讀取 OPC UA Server 清單: {e}")
+            return pd.DataFrame()
+
+    # ----------------------------------------------------------
+    # 讀取 opcua_tags（已採集的點位資料）
+    # ----------------------------------------------------------
+    def load_opcua_tags(server_id=None):
+        try:
+            with DatabaseConnector.get_connection() as conn:
+                with conn.cursor() as cur:
+                    if server_id:
+                        query = """
+                        SELECT id, server_name, node_id, browse_name, display_name,
+                               data_type, current_data, quality, plc_state, last_update
+                        FROM opcua_tags WHERE server_id = %s ORDER BY id ASC;
+                        """
+                        cur.execute(query, (int(server_id),))
+                    else:
+                        query = """
+                        SELECT id, server_name, node_id, browse_name, display_name,
+                               data_type, current_data, quality, plc_state, last_update
+                        FROM opcua_tags ORDER BY id ASC;
+                        """
+                        cur.execute(query)
+                    cols = [desc[0] for desc in cur.description]
+                    rows = cur.fetchall()
+                    return pd.DataFrame(rows, columns=cols)
+        except Exception as e:
+            st.error(f"無法讀取 OPC UA 點位資料: {e}")
+            return pd.DataFrame()
+
+    df_opcua_servers = load_opcua_servers()
+
+    # ----------------------------------------------------------
+    # Server 清單（可直接編輯）
+    # ----------------------------------------------------------
+    st.subheader("📋 OPC UA Server 清單（可直接於表格內修改參數）")
+    if not df_opcua_servers.empty:
+        disabled_cols_opcua = ["id", "conn_state", "last_scan", "last_error"]
+
+        edited_opcua_df = st.data_editor(
+            df_opcua_servers,
+            num_rows="dynamic",
+            key="opcua_editor",
+            disabled=disabled_cols_opcua,
+            width="stretch",
+        )
+
+        if st.button("💾 儲存 OPC UA Server 修改", type="primary"):
+            try:
+                with DatabaseConnector.get_connection() as conn:
+                    with conn.cursor() as cur:
+                        for index, row in edited_opcua_df.iterrows():
+                            if pd.notnull(row["id"]):
+                                sql = """
+                                UPDATE opcua_servers SET
+                                    server_name=%s, ip=%s, port=%s, username=%s, password=%s,
+                                    security_policy=%s, security_mode=%s, root_node_id=%s,
+                                    browse_depth=%s, enabled=%s
+                                WHERE id=%s;
+                                """
+                                cur.execute(
+                                    sql,
+                                    (
+                                        row["server_name"],
+                                        row["ip"],
+                                        int(row["port"]),
+                                        row["username"] if pd.notnull(row["username"]) else None,
+                                        row["password"] if pd.notnull(row["password"]) else None,
+                                        row["security_policy"],
+                                        row["security_mode"],
+                                        row["root_node_id"],
+                                        int(row["browse_depth"]),
+                                        bool(row["enabled"]),
+                                        int(row["id"]),
+                                    ),
+                                )
+                        conn.commit()
+                st.success("✅ OPC UA Server 參數更新成功！")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ 儲存失敗: {e}")
+    else:
+        st.info("目前尚無任何 OPC UA Server，請先在下方新增。")
+
+    # ----------------------------------------------------------
+    # 新增 Server 表單（含測試連線與瀏覽）
+    # ----------------------------------------------------------
+    st.divider()
+    st.subheader("➕ 新增 OPC UA Server")
+    with st.form("add_opcua_form", clear_on_submit=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            o_server_name = st.text_input("Server 名稱 (server_name)", "OPCUA_Line_A")
+            o_ip = st.text_input("IP 位址 (ip)", "192.168.1.100")
+            o_port = st.number_input("Port", value=4840)
+            o_username = st.text_input("帳號 (username，留空=匿名連線)", "")
+            o_password = st.text_input("密碼 (password)", "", type="password")
+
+        with col2:
+            o_security_policy = st.selectbox(
+                "Security Policy", ["None", "Basic256Sha256"], index=0
+            )
+            o_security_mode = st.selectbox(
+                "Security Mode", ["None", "Sign", "SignAndEncrypt"], index=0
+            )
+            o_root_node_id = st.text_input(
+                "瀏覽起始節點 (root_node_id)",
+                "i=85",
+                help="預設 i=85 為 Objects 資料夾，可指定更精確的節點以縮小瀏覽範圍",
+            )
+            o_browse_depth = st.number_input(
+                "瀏覽深度上限 (browse_depth)", value=5, min_value=1, max_value=20
+            )
+
+        btn_col1, btn_col2 = st.columns([1, 1])
+        with btn_col1:
+            submit_opcua = st.form_submit_button(
+                "新增 Server", type="primary", use_container_width=True
+            )
+        with btn_col2:
+            test_opcua = st.form_submit_button(
+                "🧪 測試連線與瀏覽", use_container_width=True
+            )
+
+        if test_opcua:
+            with st.spinner(
+                "📡 正在連線並瀏覽 Address Space（點位多時可能需要一些時間）..."
+            ):
+                try:
+                    server_cfg = {
+                        "server_name": o_server_name,
+                        "ip": o_ip,
+                        "port": int(o_port),
+                        "username": o_username or None,
+                        "password": o_password or None,
+                        "security_policy": o_security_policy,
+                        "security_mode": o_security_mode,
+                        "root_node_id": o_root_node_id,
+                        "browse_depth": int(o_browse_depth),
+                    }
+                    tags = run_async(scan_server(server_cfg))
+                    st.success(f"🎉 測試成功！共瀏覽到 {len(tags)} 個點位（此次測試不會寫入資料庫）")
+                    if tags:
+                        st.dataframe(pd.DataFrame(tags), width="stretch")
+                except OPCUAConnectionError as e:
+                    st.error(f"❌ 連線失敗: {e}")
+                except Exception as e:
+                    st.error(f"❌ 瀏覽失敗: {e}")
+
+        if submit_opcua:
+            try:
+                with DatabaseConnector.get_connection() as conn:
+                    with conn.cursor() as cur:
+                        sql = """
+                        INSERT INTO opcua_servers
+                            (server_name, ip, port, username, password, security_policy,
+                             security_mode, root_node_id, browse_depth, enabled, conn_state)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, 'UNKNOWN');
+                        """
+                        cur.execute(
+                            sql,
+                            (
+                                o_server_name,
+                                o_ip,
+                                int(o_port),
+                                o_username or None,
+                                o_password or None,
+                                o_security_policy,
+                                o_security_mode,
+                                o_root_node_id,
+                                int(o_browse_depth),
+                            ),
+                        )
+                        conn.commit()
+                st.success(f"🎉 成功新增 OPC UA Server: {o_server_name}")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ 新增失敗: {e}")
+
+    # ----------------------------------------------------------
+    # 手動立即瀏覽（不用等排程週期，寫入資料庫）
+    # ----------------------------------------------------------
+    st.divider()
+    st.subheader("🔍 手動瀏覽已儲存的 Server（立即執行，不用等排程週期）")
+    st.caption(
+        "如果擔心 main.py 排程週期太長（點位多會拖慢整輪採集），"
+        "可以在這裡針對單一 Server 立即瀏覽並直接寫入資料庫，"
+        "不影響其他 Server 的排程。"
+    )
+
+    if df_opcua_servers.empty:
+        st.info("尚無 Server 可供瀏覽，請先新增。")
+    else:
+        server_options = {
+            f"{row['server_name']} ({row['ip']}:{row['port']})": row["id"]
+            for _, row in df_opcua_servers.iterrows()
+        }
+        selected_label = st.selectbox("選擇要瀏覽的 Server", list(server_options.keys()))
+        selected_id = server_options[selected_label]
+
+        if st.button("🚀 立即瀏覽並寫入資料庫", type="primary"):
+            row = df_opcua_servers[df_opcua_servers["id"] == selected_id].iloc[0]
+            server_cfg = {
+                "server_name": row["server_name"],
+                "ip": row["ip"],
+                "port": int(row["port"]),
+                "username": row["username"] if pd.notnull(row["username"]) else None,
+                "password": row["password"] if pd.notnull(row["password"]) else None,
+                "security_policy": row["security_policy"],
+                "security_mode": row["security_mode"],
+                "root_node_id": row["root_node_id"],
+                "browse_depth": int(row["browse_depth"]),
+            }
+
+            with st.spinner(
+                f"正在瀏覽 {row['server_name']}，依點位數量可能需要幾秒到幾分鐘，請耐心等候..."
+            ):
+                try:
+                    tags = run_async(scan_server(server_cfg))
+                    batch_update_opcua_tags(int(selected_id), row["server_name"], tags)
+
+                    with DatabaseConnector.get_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                UPDATE opcua_servers
+                                SET conn_state='ONLINE', last_scan=CURRENT_TIMESTAMP, last_error=NULL
+                                WHERE id=%s
+                                """,
+                                (int(selected_id),),
+                            )
+                            conn.commit()
+
+                    st.success(f"✅ 瀏覽完成，寫入 {len(tags)} 筆點位資料")
+                    st.rerun()
+                except Exception as e:
+                    try:
+                        with DatabaseConnector.get_connection() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    UPDATE opcua_servers
+                                    SET conn_state='ERROR', last_scan=CURRENT_TIMESTAMP, last_error=%s
+                                    WHERE id=%s
+                                    """,
+                                    (str(e), int(selected_id)),
+                                )
+                                conn.commit()
+                    except Exception:
+                        pass
+                    st.error(f"❌ 瀏覽失敗: {e}")
+
+    # ----------------------------------------------------------
+    # 已採集的點位資料檢視
+    # ----------------------------------------------------------
+    st.divider()
+    st.subheader("📊 已採集的 OPC UA 點位資料")
+
+    if not df_opcua_servers.empty:
+        filter_options = ["全部 Server"] + [
+            f"{row['server_name']} ({row['ip']}:{row['port']})"
+            for _, row in df_opcua_servers.iterrows()
+        ]
+        filter_label = st.selectbox("篩選 Server", filter_options, key="opcua_tag_filter")
+
+        if filter_label == "全部 Server":
+            df_opcua_tags = load_opcua_tags()
+        else:
+            filter_id = server_options[filter_label]
+            df_opcua_tags = load_opcua_tags(server_id=filter_id)
+    else:
+        df_opcua_tags = load_opcua_tags()
+
+    if not df_opcua_tags.empty:
+        st.dataframe(df_opcua_tags, width="stretch")
+    else:
+        st.info("目前尚無任何 OPC UA 點位資料，請先新增 Server 並執行瀏覽。")

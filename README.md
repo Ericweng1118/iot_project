@@ -10,6 +10,7 @@
 
 - **S7 Protocol (Siemens)** - 透過 `snap7` 庫連線 S7-1200/1500 PLC，讀取 DB 區塊數據
 - **Modbus TCP** - 透過 `pymodbus` 庫支援 FC1/2/3/4/5/6/15/16 功能碼，處理多位元組資料型態
+- **OPC UA** - 透過 `opcua` 庫支援 OPC UA 伺服器的資料讀取與瀏覽<==目前僅供瀏覽，並註冊資料到資料庫內，尚未打包成MQTT上傳
 
 ### 2. 數據增量上傳 (Report by Exception)
 
@@ -26,7 +27,8 @@
 ```
 s7_protocol.py├── protocols/              # 協議驅動層
 │   ├── s7_protocol.py     # 西門子 S7 協議實現（DB 數據讀取）
-│   └── modbus_protocol.py # Modbus TCP 協議實現（多位元組解析）
+│   ├── modbus_protocol.py # Modbus TCP 協議實現（多位元組解析）
+│   └── opcua_protocol.py  # OPC UA 協議實現（資料讀取與瀏覽）
 ├── parsers/               # 數據解析器
 │   ├── plc_parser.py      # S7 數據解析（字節順序、線性縮放）
 │   └── encoder.py         # Modbus 編碼/解碼（32/64 位元支援）
@@ -34,10 +36,11 @@ s7_protocol.py├── protocols/              # 協議驅動層
 │   ├── db_connector.py    # PostgreSQL 連線管理與查詢封裝
 │   └── batch_updater.py   # 批量更新邏輯（execute_values）
 ├── messaging/             # 訊息通訊層
-│   └── mqtt_publisher.py     # MQTT 發送器（自動連線、失敗重試）
-├── collector/			#存放協議撈資料用的主程式
-│   ├── modbus_protocol.py    # 撈Modbus資料用的主程式
-│   └── run_s7_collector.py   # 撈S7_TIA資料用的主程式
+│   └── mqtt_publisher.py         # MQTT 發送器（自動連線、失敗重試）
+├── collector/			              #存放協議撈資料用的主程式
+│   ├── modbus_protocol.py        # 撈Modbus資料用的主程式
+│   ├── run_s7_collector.py       # 撈S7_TIA資料用的主程式
+│   └── run_opcua_collector.py    # 撈OPC UA資料用的主程式
 ├── main.py   # 統一主程式（雙協議整合）
 ├── requirements.txt       # Python 依賴套件
 ├── Dockerfile            # Docker 容器化設定
@@ -91,10 +94,14 @@ MQTT_TOPIC=iot-2/evt/wadata/fmt/scada_unified  # MQTT 發布主題
 # 採集週期 (秒)
 POLL_INTERVAL="60.0"
 
+
 #網頁小工具入口帳號、密碼、PORT
 ADMIN_USER=user
 ADMIN_PASSWORD=password
 ADMIN_PORT=PORT_NUMBER
+
+# OPC UA 查詢瀏覽週期
+OPCUA_POLL_INTERVAL="60.0"
 ```
 
 #### 3. 執行主程式
@@ -189,6 +196,43 @@ VALUES
 
 ---
 
+### opcua_servers 表格（已知 OPC UA Server 清單（連線資訊））
+
+| 欄位名稱                | 型態           | 說明                                                                        |
+| --------------------   | ------------   | --------------------------------------------------------------------------- |
+|    `id`                |SERIAL          |PRIMARY KEY,
+|    `server_name`       |VARCHAR(100)    |NOT NULL UNIQUE,   -- Server 顯示名稱（用於 MQTT Key）
+|    `ip`                |VARCHAR(50)     |NOT NULL,
+|    `port`              |INTEGER         |NOT NULL DEFAULT 4840,
+|    `username`          |VARCHAR(100),   |                -- 可為 NULL（匿名連線）
+|    `password`          |VARCHAR(200),   |                -- 建議之後改用加密儲存
+|    `security_policy`   |VARCHAR(30)     |DEFAULT 'None',    -- None / Basic256Sha256 ...
+|    `security_mode`     |VARCHAR(30)     |DEFAULT 'None',    -- None / Sign / SignAndEncrypt|
+|    `root_node_id`      |VARCHAR(100)    |DEFAULT 'i=85',    -- 瀏覽起始節點，預設 Objects 資料夾
+|    `browse_depth`      |INTEGER         |DEFAULT 5,         -- 遞迴瀏覽深度上限，避免瀏覽過大
+|    `enabled`           |BOOLEAN         |DEFAULT TRUE,       -- 是否啟用此 Server
+|    `conn_state`        |VARCHAR(20)     |DEFAULT 'UNKNOWN',  -- ONLINE / OFFLINE / ERROR
+|    `last_scan`         |TIMESTAMPTZ,
+|    `last_error`        |TEXT
+---
+
+### opcua_tags 表格（週期性瀏覽出來的點位與最新數值）
+
+| 欄位名稱                | 型態           | 說明                                                                        |
+| --------------------   | ------------   | --------------------------------------------------------------------------- |
+|    `id`                |SERIAL PRIMARY KEY,
+|    `server_id`         |INTEGER NOT NULL REFERENCES opcua_servers(id) ON DELETE CASCADE,
+|    `server_name`       |VARCHAR(100) NOT NULL,          -- 冗餘存一份，方便 MQTT Key 組合
+|    `node_id`           |VARCHAR(200) NOT NULL,          -- OPC UA NodeId 字串，例如 ns=2;s=Temp01
+|    `browse_name`       |VARCHAR(200),
+|    `display_name`      |VARCHAR(200),
+|    `data_type`         |VARCHAR(50),                    -- OPC UA VariantType 名稱
+|    `current_data`      |JSONB,                           -- 格式：{"val": 123.45}
+|    `quality`           |VARCHAR(20),                     -- GOOD / BAD / UNCERTAIN
+|    `plc_state`         |VARCHAR(20)  DEFAULT 'OFFLINE',  -- ONLINE / OFFLINE / ERROR
+|    `last_update`       |TIMESTAMPTZ,
+
+---
 ## 🎛️ Modbus TCP 參數解析
 
 ### Byte Order（位元組順序）
