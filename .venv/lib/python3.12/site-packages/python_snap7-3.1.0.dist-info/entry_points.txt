@@ -1,3 +1,0 @@
-[console_scripts]
-s7 = snap7.cli:main
-snap7-server = snap7.server:mainloop
