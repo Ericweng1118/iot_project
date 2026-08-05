@@ -885,7 +885,7 @@ with tab_opcua:
         with col1:
             o_server_name = st.text_input("Server 名稱 (server_name)", "OPCUA_Line_A")
             o_ip = st.text_input("IP 位址 (ip)", "192.168.1.100")
-            o_port = st.number_input("Port", value=4840)
+            o_port = st.number_input("Port", value=51210)
             o_username = st.text_input("帳號 (username，留空=匿名連線)", "")
             o_password = st.text_input("密碼 (password)", "", type="password")
 
@@ -1340,6 +1340,31 @@ with tab_hierarchy:
     else:
         st.info("目前尚無任何感測器，請在下方新增。新增後即可回到點位設定分頁進行綁定。")
 
+    # 常見感測器類型（可選「其他（自訂）」自行輸入）
+    SENSOR_TYPE_OPTIONS = [
+        "temperature", "pressure", "vibration", "current", "voltage",
+        "power", "energy", "flow", "level", "humidity", "speed",
+        "torque", "position", "ph", "conductivity", "weight", "count", "status",
+        "其他（自訂）",
+    ]
+
+    # 常用工程單位（依 UNECE Recommendation 20 / OPC UA Part 8 Engineering Units 慣例整理）
+    OPCUA_UNIT_OPTIONS = [
+        "°C", "°F", "K",
+        "Pa", "kPa", "bar", "mbar", "psi",
+        "m/s", "mm/s", "m/s²", "rpm", "Hz",
+        "V", "mV", "A", "mA",
+        "W", "kW", "Wh", "kWh", "VA", "var",
+        "%", "%RH",
+        "L", "L/min", "m³", "m³/h",
+        "mm", "cm", "m",
+        "g", "kg", "t",
+        "N", "Nm",
+        "pH", "μS/cm",
+        "count",
+        "其他（自訂）",
+    ]
+
     with st.form("add_sensor_form", clear_on_submit=True):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -1350,13 +1375,39 @@ with tab_hierarchy:
                 st.warning("⚠️ 請先新增設備")
             new_sensor_code = st.text_input("感測器編號 (sensor_code，唯一)", "")
         with col2:
-            new_sensor_type = st.text_input("感測器類型 (sensor_type)", "temperature")
-            new_sensor_unit = st.text_input("單位 (unit)", "°C")
+            new_sensor_type_selected = st.selectbox(
+                "感測器類型 (sensor_type)", SENSOR_TYPE_OPTIONS, index=0
+            )
+            new_sensor_type_custom = st.text_input(
+                "↳ 選「其他（自訂）」時請在此輸入",
+                "",
+                placeholder="例如：oil_pressure",
+                key="new_sensor_type_custom",
+            )
+            new_sensor_unit_selected = st.selectbox(
+                "單位 (unit，依 OPC UA 工程單位慣例)", OPCUA_UNIT_OPTIONS, index=0
+            )
+            new_sensor_unit_custom = st.text_input(
+                "↳ 選「其他（自訂）」時請在此輸入",
+                "",
+                placeholder="例如：mmHg",
+                key="new_sensor_unit_custom",
+            )
         with col3:
             new_sensor_min = st.number_input("正常值下限 (min_threshold)", value=0.0)
             new_sensor_max = st.number_input("正常值上限 (max_threshold)", value=100.0)
         if st.form_submit_button("➕ 新增感測器", type="primary"):
-            if new_sensor_code.strip() and new_sensor_device:
+            final_sensor_type = (
+                new_sensor_type_custom.strip()
+                if new_sensor_type_selected == "其他（自訂）"
+                else new_sensor_type_selected
+            )
+            final_sensor_unit = (
+                new_sensor_unit_custom.strip()
+                if new_sensor_unit_selected == "其他（自訂）"
+                else new_sensor_unit_selected
+            )
+            if new_sensor_code.strip() and new_sensor_device and final_sensor_type:
                 try:
                     with DatabaseConnector.get_connection() as conn:
                         with conn.cursor() as cur:
@@ -1368,9 +1419,9 @@ with tab_hierarchy:
                                 """,
                                 (
                                     device_options[new_sensor_device],
-                                    new_sensor_code,
-                                    new_sensor_type,
-                                    new_sensor_unit or None,
+                                    new_sensor_code.strip(),
+                                    final_sensor_type,
+                                    final_sensor_unit or None,
                                     new_sensor_min,
                                     new_sensor_max,
                                 ),

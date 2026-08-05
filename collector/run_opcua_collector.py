@@ -11,7 +11,9 @@ OPC UA 資料採集主程式（週期性排程用）。
 1. 從 opcua_servers 撈出所有 enabled=TRUE 的 Server
 2. 並行連線每台 Server，遞迴瀏覽 Address Space 取得所有 Variable 節點數值
 3. 呼叫 batch_update_opcua_tags() 批量 UPSERT 進 opcua_tags
+   （該函式內部也會依已綁定的 sensor_id，把數值暫存進 sensor_readings 緩衝區）
 4. 更新 opcua_servers 的 conn_state / last_scan / last_error
+5. 全部 Server 掃描完後，統一 flush 一次 sensor_readings 緩衝區
 """
 
 import asyncio
@@ -20,6 +22,7 @@ import sys
 
 from data_layer.db_connector import DatabaseConnector
 from data_layer.batch_updater import batch_update_opcua_tags
+from data_layer.timeseries_writer import sensor_reading_writer
 from protocols.opcua_protocol import scan_server, OPCUAConnectionError
 
 logger = logging.getLogger(__name__)
@@ -110,6 +113,9 @@ def collect_opcua_data():
         batch_update_opcua_tags(server_id, server_name, tags)
         update_server_status(server_id, "ONLINE")
 
+    # 所有 Server 掃描完成後，統一把本輪暫存的時序資料批次寫進 sensor_readings
+    sensor_reading_writer.flush()
+
     logger.info("OPC UA 採集任務結束。")
 
 
@@ -121,6 +127,8 @@ if __name__ == "__main__":
     )
     try:
         DatabaseConnector.initialize_pool()
+        # 單獨執行本檔案時，需要自行載入 sensor_readings 心跳快取
+        sensor_reading_writer.load_initial_cache()
         collect_opcua_data()
     except Exception as e:
         logger.error(f"主程式執行異常: {e}", exc_info=True)

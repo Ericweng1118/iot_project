@@ -3,3 +3,8 @@
 .gitignore
 .venv/
 venv/
+/.docker_images
+.dockerignore
+.gitignore
+001_sensor_hierarchy_and_mapping.sql
+INTEGRATION_GUIDE.md

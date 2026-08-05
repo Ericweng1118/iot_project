@@ -84,9 +84,9 @@ class SensorReadingWriter:
         try:
             num_value = float(value)
         except (TypeError, ValueError):
-            logger.debug(
-                f"sensor_id={sensor_id} 的值 '{value}' 非數值型態，"
-                "sensor_readings 僅支援數字，已略過。"
+            logger.info(
+                f"⚠️ sensor_id={sensor_id} 的值 '{value}' (type={type(value).__name__}) "
+                "無法轉成數字，sensor_readings 僅支援數字，已略過。"
             )
             return
 
@@ -94,23 +94,40 @@ class SensorReadingWriter:
         last = self._last_values.get(sensor_id)
 
         should_write = False
+        reason = ""
         if last is None:
             should_write = True
+            reason = "首次出現"
         else:
             last_value, last_time = last
             if num_value != last_value:
                 should_write = True
+                reason = f"數值變化 {last_value} -> {num_value}"
             elif now - last_time > self.heartbeat_interval:
                 should_write = True
+                reason = "心跳補寫"
+            else:
+                reason = f"數值未變化且未到心跳時間（距上次 {now - last_time}）"
+
+        logger.info(
+            f"🧾 stage 判斷: sensor_id={sensor_id}, value={num_value}, "
+            f"要寫入={should_write}（{reason}），writer_id={id(self)}"
+        )
 
         if should_write:
             self._pending.append((sensor_id, now, num_value))
             self._last_values[sensor_id] = (num_value, now)
+            logger.info(
+                f"📦 已放入緩衝區，目前緩衝區筆數={len(self._pending)}, writer_id={id(self)}"
+            )
 
     # ------------------------------------------------------------
     # 把緩衝區的資料批次寫進資料庫
     # ------------------------------------------------------------
     def flush(self):
+        logger.info(
+            f"🚿 flush() 被呼叫，目前緩衝區筆數={len(self._pending)}, writer_id={id(self)}"
+        )
         if not self._pending:
             return 0
 
