@@ -305,9 +305,40 @@ if not hasattr(st, "db_inited"):
     DatabaseConnector.initialize_pool()
     st.db_inited = True
 
-tab_modbus, tab_tia, tab_opcua = st.tabs(
-    ["📡 Modbus 點位設定", "📡 TIA (S7) 點位設定", "📡 OPC UA 點位設定"]
+tab_modbus, tab_tia, tab_opcua, tab_hierarchy = st.tabs(
+    [
+        "📡 Modbus 點位設定",
+        "📡 TIA (S7) 點位設定",
+        "📡 OPC UA 點位設定",
+        "🧬 感測器階層管理",
+    ]
 )
+
+
+# ------------------------------------------------------------------
+# Helper: 讀取目前所有 sensors（給下拉選單、綁定用）
+# ------------------------------------------------------------------
+def load_sensor_options():
+    """回傳 sensor_code -> sensor_id 對照表，以及供下拉選單使用的清單"""
+    try:
+        with DatabaseConnector.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT sensor_id, sensor_code, sensor_type, unit
+                    FROM sensors
+                    ORDER BY sensor_code ASC;
+                    """
+                )
+                rows = cur.fetchall()
+        code_to_id = {r[1]: r[0] for r in rows}
+        id_to_code = {r[0]: r[1] for r in rows}
+        # 下拉選單顯示 "sensor_code (sensor_type/unit)"，但實際存取用純 sensor_code 對照
+        display_options = ["（未綁定）"] + [r[1] for r in rows]
+        return code_to_id, id_to_code, display_options
+    except Exception as e:
+        st.error(f"無法讀取 sensors 清單: {e}")
+        return {}, {}, ["（未綁定）"]
 
 
 # ==========================================
@@ -322,11 +353,13 @@ with tab_modbus:
                 with conn.cursor() as cur:
                     query = """
                     SELECT 
-                        id, name, plc_ip, plc_port, slave_id, function_code, start_address, 
-                        data_type, raw_min, raw_max, eng_min, eng_max, byte_order, word_order,
-                        state_dictionary, plc_state, current_value,current_data,unit, last_update
-                    FROM modbus_scada 
-                    ORDER BY id ASC;
+                        m.id, m.name, m.plc_ip, m.plc_port, m.slave_id, m.function_code, m.start_address, 
+                        m.data_type, m.raw_min, m.raw_max, m.eng_min, m.eng_max, m.byte_order, m.word_order,
+                        m.state_dictionary, m.plc_state, m.current_value, m.current_data, m.unit, m.last_update,
+                        s.sensor_code
+                    FROM modbus_scada m
+                    LEFT JOIN sensors s ON m.sensor_id = s.sensor_id
+                    ORDER BY m.id ASC;
                     """
                     cur.execute(query)
                     cols = [desc[0] for desc in cur.description]
@@ -337,9 +370,16 @@ with tab_modbus:
             return pd.DataFrame()
 
     df_modbus = load_modbus_tags()
+    modbus_code_to_id, modbus_id_to_code, modbus_sensor_options = load_sensor_options()
 
     st.subheader("📋 Modbus 點位列表（可直接於表格內修改參數）")
+    st.caption(
+        "「sensor_code」欄位是要把這個點位綁定到 sensors 階層的哪一個感測器，"
+        "選「（未綁定）」代表不寫入 sensor_readings 時序表。"
+    )
     if not df_modbus.empty:
+        df_modbus["sensor_code"] = df_modbus["sensor_code"].fillna("（未綁定）")
+
         disabled_cols_modbus = [
             "id",
             "plc_state",
@@ -353,6 +393,13 @@ with tab_modbus:
             key="modbus_editor",
             disabled=disabled_cols_modbus,
             width="stretch",
+            column_config={
+                "sensor_code": st.column_config.SelectboxColumn(
+                    "sensor_code（綁定感測器）",
+                    options=modbus_sensor_options,
+                    required=True,
+                )
+            },
         )
 
         if st.button("💾 儲存 Modbus 修改", type="primary"):
@@ -365,12 +412,16 @@ with tab_modbus:
                                 if isinstance(state_dict_val, dict):
                                     state_dict_val = json.dumps(state_dict_val)
 
+                                selected_code = row.get("sensor_code")
+                                sensor_id_val = modbus_code_to_id.get(selected_code)
+
                                 sql = """
                                 UPDATE modbus_scada SET 
                                     name=%s, plc_ip=%s, plc_port=%s, slave_id=%s, 
                                     function_code=%s, start_address=%s, data_type=%s,
                                     raw_min=%s, raw_max=%s, eng_min=%s, eng_max=%s,
-                                    byte_order=%s, word_order=%s, state_dictionary=%s
+                                    byte_order=%s, word_order=%s, state_dictionary=%s,
+                                    sensor_id=%s
                                 WHERE id=%s;
                                 """
                                 cur.execute(
@@ -400,6 +451,7 @@ with tab_modbus:
                                         state_dict_val
                                         if pd.notnull(state_dict_val)
                                         else None,
+                                        sensor_id_val,
                                         int(row["id"]),
                                     ),
                                 )
@@ -556,10 +608,11 @@ with tab_tia:
                 with conn.cursor() as cur:
                     query = """
                     SELECT 
-                        id, name, plc_name, plc_ip, db_number, "offset", data_type, 
-                        plc_state, current_data, last_update 
-                    FROM tia_scada 
-                    ORDER BY id ASC;
+                        t.id, t.name, t.plc_name, t.plc_ip, t.db_number, t."offset", t.data_type, 
+                        t.plc_state, t.current_data, t.last_update, s.sensor_code
+                    FROM tia_scada t
+                    LEFT JOIN sensors s ON t.sensor_id = s.sensor_id
+                    ORDER BY t.id ASC;
                     """
                     cur.execute(query)
                     cols = [desc[0] for desc in cur.description]
@@ -570,9 +623,16 @@ with tab_tia:
             return pd.DataFrame()
 
     df_tia = load_tia_tags()
+    tia_code_to_id, tia_id_to_code, tia_sensor_options = load_sensor_options()
 
     st.subheader("📋 TIA 點位列表（可直接於表格內修改參數）")
+    st.caption(
+        "「sensor_code」欄位是要把這個點位綁定到 sensors 階層的哪一個感測器，"
+        "選「（未綁定）」代表不寫入 sensor_readings 時序表。"
+    )
     if not df_tia.empty:
+        df_tia["sensor_code"] = df_tia["sensor_code"].fillna("（未綁定）")
+
         disabled_cols_tia = ["id", "plc_state", "current_data", "last_update"]
 
         edited_tia_df = st.data_editor(
@@ -581,6 +641,13 @@ with tab_tia:
             key="tia_editor",
             disabled=disabled_cols_tia,
             width="stretch",
+            column_config={
+                "sensor_code": st.column_config.SelectboxColumn(
+                    "sensor_code（綁定感測器）",
+                    options=tia_sensor_options,
+                    required=True,
+                )
+            },
         )
 
         if st.button("💾 儲存 TIA 修改", type="primary"):
@@ -589,10 +656,13 @@ with tab_tia:
                     with conn.cursor() as cur:
                         for index, row in edited_tia_df.iterrows():
                             if pd.notnull(row["id"]):
+                                selected_code = row.get("sensor_code")
+                                sensor_id_val = tia_code_to_id.get(selected_code)
+
                                 sql = """
                                 UPDATE tia_scada SET 
                                     name=%s, plc_name=%s, plc_ip=%s, db_number=%s, 
-                                    "offset"=%s, data_type=%s
+                                    "offset"=%s, data_type=%s, sensor_id=%s
                                 WHERE id=%s;
                                 """
                                 cur.execute(
@@ -604,6 +674,7 @@ with tab_tia:
                                         int(row["db_number"]),
                                         int(row["offset"]),
                                         row["data_type"],
+                                        sensor_id_val,
                                         int(row["id"]),
                                     ),
                                 )
@@ -725,16 +796,22 @@ with tab_opcua:
                 with conn.cursor() as cur:
                     if server_id:
                         query = """
-                        SELECT id, server_name, node_id, browse_name, display_name,
-                               data_type, current_data, quality, plc_state, last_update
-                        FROM opcua_tags WHERE server_id = %s ORDER BY id ASC;
+                        SELECT o.id, o.server_name, o.node_id, o.browse_name, o.display_name,
+                               o.data_type, o.current_data, o.quality, o.plc_state, o.last_update,
+                               s.sensor_code
+                        FROM opcua_tags o
+                        LEFT JOIN sensors s ON o.sensor_id = s.sensor_id
+                        WHERE o.server_id = %s ORDER BY o.id ASC;
                         """
                         cur.execute(query, (int(server_id),))
                     else:
                         query = """
-                        SELECT id, server_name, node_id, browse_name, display_name,
-                               data_type, current_data, quality, plc_state, last_update
-                        FROM opcua_tags ORDER BY id ASC;
+                        SELECT o.id, o.server_name, o.node_id, o.browse_name, o.display_name,
+                               o.data_type, o.current_data, o.quality, o.plc_state, o.last_update,
+                               s.sensor_code
+                        FROM opcua_tags o
+                        LEFT JOIN sensors s ON o.sensor_id = s.sensor_id
+                        ORDER BY o.id ASC;
                         """
                         cur.execute(query)
                     cols = [desc[0] for desc in cur.description]
@@ -988,6 +1065,320 @@ with tab_opcua:
         df_opcua_tags = load_opcua_tags()
 
     if not df_opcua_tags.empty:
-        st.dataframe(df_opcua_tags, width="stretch")
+        opcua_code_to_id, opcua_id_to_code, opcua_sensor_options = load_sensor_options()
+        df_opcua_tags["sensor_code"] = df_opcua_tags["sensor_code"].fillna("（未綁定）")
+
+        st.caption(
+            "「sensor_code」欄位是要把這個點位綁定到 sensors 階層的哪一個感測器，"
+            "選「（未綁定）」代表不寫入 sensor_readings 時序表。"
+        )
+
+        disabled_cols_opcua_tags = [
+            "id", "server_name", "node_id", "browse_name", "display_name",
+            "data_type", "current_data", "quality", "plc_state", "last_update",
+        ]
+
+        edited_opcua_tags_df = st.data_editor(
+            df_opcua_tags,
+            num_rows="fixed",
+            key="opcua_tags_editor",
+            disabled=disabled_cols_opcua_tags,
+            width="stretch",
+            column_config={
+                "sensor_code": st.column_config.SelectboxColumn(
+                    "sensor_code（綁定感測器）",
+                    options=opcua_sensor_options,
+                    required=True,
+                )
+            },
+        )
+
+        if st.button("💾 儲存 OPC UA 點位的感測器綁定", type="primary"):
+            try:
+                with DatabaseConnector.get_connection() as conn:
+                    with conn.cursor() as cur:
+                        for index, row in edited_opcua_tags_df.iterrows():
+                            selected_code = row.get("sensor_code")
+                            sensor_id_val = opcua_code_to_id.get(selected_code)
+                            cur.execute(
+                                "UPDATE opcua_tags SET sensor_id=%s WHERE id=%s;",
+                                (sensor_id_val, int(row["id"])),
+                            )
+                        conn.commit()
+                st.success("✅ OPC UA 點位感測器綁定更新成功！")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ 儲存失敗: {e}")
     else:
         st.info("目前尚無任何 OPC UA 點位資料，請先新增 Server 並執行瀏覽。")
+
+
+# ==========================================
+# Tab 4: 感測器階層管理 (sites -> production_lines -> devices -> sensors)
+# ==========================================
+with tab_hierarchy:
+    st.header("感測器階層管理")
+    st.caption(
+        "在這裡建立 廠區 → 產線 → 設備 → 感測器 的階層資料。"
+        "建立好 sensor 之後，回到「Modbus/TIA/OPC UA 點位設定」分頁，"
+        "把每個點位的 sensor_code 欄位選成對應的感測器，"
+        "採集程式就會自動把數值寫進 sensor_readings 時序表。"
+    )
+
+    # ------------------------------------------------------------
+    # 通用查詢 helper
+    # ------------------------------------------------------------
+    def _fetch_df(query):
+        try:
+            with DatabaseConnector.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query)
+                    cols = [desc[0] for desc in cur.description]
+                    rows = cur.fetchall()
+                    return pd.DataFrame(rows, columns=cols)
+        except Exception as e:
+            st.error(f"查詢失敗: {e}")
+            return pd.DataFrame()
+
+    # ------------------------------------------------------------
+    # 1. 廠區 (sites)
+    # ------------------------------------------------------------
+    st.subheader("🏭 廠區 (sites)")
+    df_sites = _fetch_df(
+        "SELECT site_id, site_name, location FROM sites ORDER BY site_id ASC;"
+    )
+    if not df_sites.empty:
+        edited_sites = st.data_editor(
+            df_sites, num_rows="dynamic", key="sites_editor",
+            disabled=["site_id"], width="stretch",
+        )
+        if st.button("💾 儲存廠區修改", key="save_sites"):
+            try:
+                with DatabaseConnector.get_connection() as conn:
+                    with conn.cursor() as cur:
+                        for _, row in edited_sites.iterrows():
+                            if pd.notnull(row["site_id"]):
+                                cur.execute(
+                                    "UPDATE sites SET site_name=%s, location=%s WHERE site_id=%s;",
+                                    (row["site_name"], row["location"], int(row["site_id"])),
+                                )
+                        conn.commit()
+                st.success("✅ 廠區資料更新成功！")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ 儲存失敗: {e}")
+
+    with st.form("add_site_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            new_site_name = st.text_input("廠區名稱 (site_name)", "")
+        with col2:
+            new_site_location = st.text_input("位置 (location)", "")
+        if st.form_submit_button("➕ 新增廠區", type="primary"):
+            if new_site_name.strip():
+                try:
+                    with DatabaseConnector.get_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "INSERT INTO sites (site_name, location) VALUES (%s, %s);",
+                                (new_site_name, new_site_location or None),
+                            )
+                            conn.commit()
+                    st.success(f"🎉 成功新增廠區: {new_site_name}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 新增失敗: {e}")
+            else:
+                st.warning("⚠️ 請輸入廠區名稱")
+
+    st.divider()
+
+    # ------------------------------------------------------------
+    # 2. 產線 (production_lines)
+    # ------------------------------------------------------------
+    st.subheader("🏗️ 產線 (production_lines)")
+    df_lines = _fetch_df(
+        """
+        SELECT pl.line_id, s.site_name, pl.line_name, pl.site_id
+        FROM production_lines pl
+        LEFT JOIN sites s ON pl.site_id = s.site_id
+        ORDER BY pl.line_id ASC;
+        """
+    )
+    site_options = {row["site_name"]: row["site_id"] for _, row in df_sites.iterrows()} if not df_sites.empty else {}
+
+    if not df_lines.empty:
+        st.dataframe(df_lines[["line_id", "site_name", "line_name"]], width="stretch")
+
+    with st.form("add_line_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            if site_options:
+                new_line_site = st.selectbox("所屬廠區 (site_name)", list(site_options.keys()))
+            else:
+                new_line_site = None
+                st.warning("⚠️ 請先新增廠區")
+        with col2:
+            new_line_name = st.text_input("產線名稱 (line_name)", "")
+        if st.form_submit_button("➕ 新增產線", type="primary"):
+            if new_line_name.strip() and new_line_site:
+                try:
+                    with DatabaseConnector.get_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "INSERT INTO production_lines (site_id, line_name) VALUES (%s, %s);",
+                                (site_options[new_line_site], new_line_name),
+                            )
+                            conn.commit()
+                    st.success(f"🎉 成功新增產線: {new_line_name}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 新增失敗: {e}")
+            else:
+                st.warning("⚠️ 請輸入產線名稱並選擇所屬廠區")
+
+    st.divider()
+
+    # ------------------------------------------------------------
+    # 3. 設備 (devices)
+    # ------------------------------------------------------------
+    st.subheader("⚙️ 設備 (devices)")
+    df_devices = _fetch_df(
+        """
+        SELECT d.device_id, s.site_name, pl.line_name, d.device_code, d.device_name,
+               d.device_type, d.manufacturer, d.install_date, d.status, d.line_id
+        FROM devices d
+        LEFT JOIN production_lines pl ON d.line_id = pl.line_id
+        LEFT JOIN sites s ON pl.site_id = s.site_id
+        ORDER BY d.device_id ASC;
+        """
+    )
+    line_options = {
+        f"{row['site_name']} / {row['line_name']}": row["line_id"]
+        for _, row in df_lines.iterrows()
+    } if not df_lines.empty else {}
+
+    if not df_devices.empty:
+        st.dataframe(
+            df_devices[[
+                "device_id", "site_name", "line_name", "device_code",
+                "device_name", "device_type", "manufacturer", "install_date", "status",
+            ]],
+            width="stretch",
+        )
+
+    with st.form("add_device_form", clear_on_submit=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if line_options:
+                new_device_line = st.selectbox("所屬產線", list(line_options.keys()))
+            else:
+                new_device_line = None
+                st.warning("⚠️ 請先新增產線")
+            new_device_code = st.text_input("設備編號 (device_code，唯一)", "")
+        with col2:
+            new_device_name = st.text_input("設備名稱 (device_name)", "")
+            new_device_type = st.text_input("設備類型 (device_type)", "")
+        with col3:
+            new_device_manufacturer = st.text_input("製造商 (manufacturer)", "")
+            new_device_status = st.selectbox("狀態 (status)", ["active", "maintenance", "offline"])
+        if st.form_submit_button("➕ 新增設備", type="primary"):
+            if new_device_code.strip() and new_device_line:
+                try:
+                    with DatabaseConnector.get_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO devices (line_id, device_code, device_name, device_type, manufacturer, status)
+                                VALUES (%s, %s, %s, %s, %s, %s);
+                                """,
+                                (
+                                    line_options[new_device_line],
+                                    new_device_code,
+                                    new_device_name or None,
+                                    new_device_type or None,
+                                    new_device_manufacturer or None,
+                                    new_device_status,
+                                ),
+                            )
+                            conn.commit()
+                    st.success(f"🎉 成功新增設備: {new_device_code}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 新增失敗（device_code 需為唯一值）: {e}")
+            else:
+                st.warning("⚠️ 請輸入設備編號並選擇所屬產線")
+
+    st.divider()
+
+    # ------------------------------------------------------------
+    # 4. 感測器 (sensors)
+    # ------------------------------------------------------------
+    st.subheader("🌡️ 感測器 (sensors)")
+    df_sensors_full = _fetch_df(
+        """
+        SELECT se.sensor_id, d.device_code, se.sensor_code, se.sensor_type,
+               se.unit, se.min_threshold, se.max_threshold, se.device_id
+        FROM sensors se
+        LEFT JOIN devices d ON se.device_id = d.device_id
+        ORDER BY se.sensor_id ASC;
+        """
+    )
+    device_options = {
+        row["device_code"]: row["device_id"]
+        for _, row in df_devices.iterrows()
+    } if not df_devices.empty else {}
+
+    if not df_sensors_full.empty:
+        st.dataframe(
+            df_sensors_full[[
+                "sensor_id", "device_code", "sensor_code", "sensor_type",
+                "unit", "min_threshold", "max_threshold",
+            ]],
+            width="stretch",
+        )
+    else:
+        st.info("目前尚無任何感測器，請在下方新增。新增後即可回到點位設定分頁進行綁定。")
+
+    with st.form("add_sensor_form", clear_on_submit=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if device_options:
+                new_sensor_device = st.selectbox("所屬設備 (device_code)", list(device_options.keys()))
+            else:
+                new_sensor_device = None
+                st.warning("⚠️ 請先新增設備")
+            new_sensor_code = st.text_input("感測器編號 (sensor_code，唯一)", "")
+        with col2:
+            new_sensor_type = st.text_input("感測器類型 (sensor_type)", "temperature")
+            new_sensor_unit = st.text_input("單位 (unit)", "°C")
+        with col3:
+            new_sensor_min = st.number_input("正常值下限 (min_threshold)", value=0.0)
+            new_sensor_max = st.number_input("正常值上限 (max_threshold)", value=100.0)
+        if st.form_submit_button("➕ 新增感測器", type="primary"):
+            if new_sensor_code.strip() and new_sensor_device:
+                try:
+                    with DatabaseConnector.get_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO sensors
+                                    (device_id, sensor_code, sensor_type, unit, min_threshold, max_threshold)
+                                VALUES (%s, %s, %s, %s, %s, %s);
+                                """,
+                                (
+                                    device_options[new_sensor_device],
+                                    new_sensor_code,
+                                    new_sensor_type,
+                                    new_sensor_unit or None,
+                                    new_sensor_min,
+                                    new_sensor_max,
+                                ),
+                            )
+                            conn.commit()
+                    st.success(f"🎉 成功新增感測器: {new_sensor_code}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 新增失敗（sensor_code 需為唯一值）: {e}")
+            else:
+                st.warning("⚠️ 請輸入感測器編號並選擇所屬設備")

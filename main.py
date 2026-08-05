@@ -27,6 +27,7 @@ except ValueError:
 
 # 匯入 DB 與 MQTT 模組
 from data_layer.db_connector import DatabaseConnector
+from data_layer.timeseries_writer import sensor_reading_writer
 from messaging.mqtt_publisher import MQTTPublisher
 
 # 匯入採集模組
@@ -118,12 +119,20 @@ def main():
         logging.error("❌ PostgreSQL 連線池初始化失敗，主服務無法啟動！")
         return
 
+    # 1.1 載入 sensor_readings 心跳快取（避免服務重啟後心跳判斷從頭算）
+    sensor_reading_writer.load_initial_cache()
+
     # 2. 初始化 MQTT Publisher
     mqtt_pub = None
-    try:
-        mqtt_pub = MQTTPublisher()
-    except Exception as e:
-        logging.error(f"⚠️ MQTT 客戶端初始化失敗: {e}")
+    mqtt_enabled = os.getenv("MQTT_ENABLED", "true").strip().lower() != "false"
+
+    if mqtt_enabled:
+        try:
+            mqtt_pub = MQTTPublisher()
+        except Exception as e:
+            logging.error(f"⚠️ MQTT 客戶端初始化失敗: {e}")
+    else:
+        logging.info("🔕 MQTT 上傳功能已停用 (MQTT_ENABLED=false)")
 
     logging.info(f"⏱️ 當前設定採集週期: {POLL_INTERVAL} 秒")
     cycle_count = 0

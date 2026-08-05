@@ -200,19 +200,19 @@ VALUES
 
 | 欄位名稱                | 型態           | 說明                                                                        |
 | --------------------   | ------------   | --------------------------------------------------------------------------- |
-|    `id`                |SERIAL          |PRIMARY KEY,
+|    `id`                |SERIAL          |PRIMARY KEY
 |    `server_name`       |VARCHAR(100)    |NOT NULL UNIQUE,   -- Server 顯示名稱（用於 MQTT Key）
-|    `ip`                |VARCHAR(50)     |NOT NULL,
-|    `port`              |INTEGER         |NOT NULL DEFAULT 4840,
+|    `ip`                |VARCHAR(50)     |NOT NULL
+|    `port`              |INTEGER         |NOT NULL DEFAULT 4840
 |    `username`          |VARCHAR(100),   |                -- 可為 NULL（匿名連線）
 |    `password`          |VARCHAR(200),   |                -- 建議之後改用加密儲存
-|    `security_policy`   |VARCHAR(30)     |DEFAULT 'None',    -- None / Basic256Sha256 ...
-|    `security_mode`     |VARCHAR(30)     |DEFAULT 'None',    -- None / Sign / SignAndEncrypt|
-|    `root_node_id`      |VARCHAR(100)    |DEFAULT 'i=85',    -- 瀏覽起始節點，預設 Objects 資料夾
-|    `browse_depth`      |INTEGER         |DEFAULT 5,         -- 遞迴瀏覽深度上限，避免瀏覽過大
-|    `enabled`           |BOOLEAN         |DEFAULT TRUE,       -- 是否啟用此 Server
-|    `conn_state`        |VARCHAR(20)     |DEFAULT 'UNKNOWN',  -- ONLINE / OFFLINE / ERROR
-|    `last_scan`         |TIMESTAMPTZ,
+|    `security_policy`   |VARCHAR(30)     |DEFAULT 'None'    -- None / Basic256Sha256 ...
+|    `security_mode`     |VARCHAR(30)     |DEFAULT 'None'    -- None / Sign / SignAndEncrypt|
+|    `root_node_id`      |VARCHAR(100)    |DEFAULT 'i=85'    -- 瀏覽起始節點，預設 Objects 資料夾
+|    `browse_depth`      |INTEGER         |DEFAULT 5         -- 遞迴瀏覽深度上限，避免瀏覽過大
+|    `enabled`           |BOOLEAN         |DEFAULT TRUE       -- 是否啟用此 Server
+|    `conn_state`        |VARCHAR(20)     |DEFAULT 'UNKNOWN'  -- ONLINE / OFFLINE / ERROR
+|    `last_scan`         |TIMESTAMPTZ
 |    `last_error`        |TEXT
 ---
 
@@ -220,17 +220,17 @@ VALUES
 
 | 欄位名稱                | 型態           | 說明                                                                        |
 | --------------------   | ------------   | --------------------------------------------------------------------------- |
-|    `id`                |SERIAL PRIMARY KEY,
-|    `server_id`         |INTEGER NOT NULL REFERENCES opcua_servers(id) ON DELETE CASCADE,
-|    `server_name`       |VARCHAR(100) NOT NULL,          -- 冗餘存一份，方便 MQTT Key 組合
-|    `node_id`           |VARCHAR(200) NOT NULL,          -- OPC UA NodeId 字串，例如 ns=2;s=Temp01
-|    `browse_name`       |VARCHAR(200),
-|    `display_name`      |VARCHAR(200),
-|    `data_type`         |VARCHAR(50),                    -- OPC UA VariantType 名稱
-|    `current_data`      |JSONB,                           -- 格式：{"val": 123.45}
-|    `quality`           |VARCHAR(20),                     -- GOOD / BAD / UNCERTAIN
-|    `plc_state`         |VARCHAR(20)  DEFAULT 'OFFLINE',  -- ONLINE / OFFLINE / ERROR
-|    `last_update`       |TIMESTAMPTZ,
+|    `id`                |SERIAL          |PRIMARY KEY
+|    `server_id`         |INTEGER         |NOT NULL REFERENCES opcua_servers(id) ON DELETE CASCADE,
+|    `server_name`       |VARCHAR(100)    |NOT NULL          -- 冗餘存一份，方便 MQTT Key 組合
+|    `node_id`           |VARCHAR(200)    |NOT NULL          -- OPC UA NodeId 字串，例如 ns=2;s=Temp01
+|    `browse_name`       |VARCHAR(200)    |
+|    `display_name`      |VARCHAR(200)    |
+|    `data_type`         |VARCHAR(50)     |                    -- OPC UA VariantType 名稱
+|    `current_data`      |JSONB,          |                 -- 格式：{"val": 123.45}
+|    `quality`           |VARCHAR(20)     |                 -- GOOD / BAD / UNCERTAIN
+|    `plc_state`         |VARCHAR(20)     |DEFAULT 'OFFLINE',  -- ONLINE / OFFLINE / ERROR
+|    `last_update`       |TIMESTAMPTZ
 
 ---
 ## 🎛️ Modbus TCP 參數解析
