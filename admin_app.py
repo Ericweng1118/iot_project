@@ -305,12 +305,13 @@ if not hasattr(st, "db_inited"):
     DatabaseConnector.initialize_pool()
     st.db_inited = True
 
-tab_modbus, tab_tia, tab_opcua, tab_hierarchy = st.tabs(
+tab_modbus, tab_tia, tab_opcua, tab_hierarchy, tab_alerts = st.tabs(
     [
         "📡 Modbus 點位設定",
         "📡 TIA (S7) 點位設定",
         "📡 OPC UA 點位設定",
         "🧬 感測器階層管理",
+        "🚨 異常監控",
     ]
 )
 
@@ -318,24 +319,34 @@ tab_modbus, tab_tia, tab_opcua, tab_hierarchy = st.tabs(
 # ------------------------------------------------------------------
 # Helper: 讀取目前所有 sensors（給下拉選單、綁定用）
 # ------------------------------------------------------------------
+def _sensor_label(sensor_code, nickname):
+    """組合下拉選單顯示用的標籤：有暱稱就顯示「代號（暱稱）」，沒有就只顯示代號"""
+    if sensor_code is None or (isinstance(sensor_code, float) and pd.isna(sensor_code)):
+        return "（未綁定）"
+    if nickname and str(nickname).strip() and str(nickname).strip().lower() != "nan":
+        return f"{sensor_code}（{nickname}）"
+    return str(sensor_code)
+
+
 def load_sensor_options():
-    """回傳 sensor_code -> sensor_id 對照表，以及供下拉選單使用的清單"""
+    """回傳 label -> sensor_id 對照表，以及供下拉選單使用的清單
+    label 格式為「sensor_code（nickname）」，方便對照識別；沒有 nickname 則只顯示 sensor_code。
+    """
     try:
         with DatabaseConnector.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT sensor_id, sensor_code, sensor_type, unit
+                    SELECT sensor_id, sensor_code, nickname, sensor_type, unit
                     FROM sensors
                     ORDER BY sensor_code ASC;
                     """
                 )
                 rows = cur.fetchall()
-        code_to_id = {r[1]: r[0] for r in rows}
-        id_to_code = {r[0]: r[1] for r in rows}
-        # 下拉選單顯示 "sensor_code (sensor_type/unit)"，但實際存取用純 sensor_code 對照
-        display_options = ["（未綁定）"] + [r[1] for r in rows]
-        return code_to_id, id_to_code, display_options
+        label_to_id = {_sensor_label(r[1], r[2]): r[0] for r in rows}
+        id_to_label = {r[0]: _sensor_label(r[1], r[2]) for r in rows}
+        display_options = ["（未綁定）"] + list(label_to_id.keys())
+        return label_to_id, id_to_label, display_options
     except Exception as e:
         st.error(f"無法讀取 sensors 清單: {e}")
         return {}, {}, ["（未綁定）"]
@@ -356,7 +367,7 @@ with tab_modbus:
                         m.id, m.name, m.plc_ip, m.plc_port, m.slave_id, m.function_code, m.start_address, 
                         m.data_type, m.raw_min, m.raw_max, m.eng_min, m.eng_max, m.byte_order, m.word_order,
                         m.state_dictionary, m.plc_state, m.current_value, m.current_data, m.unit, m.last_update,
-                        s.sensor_code
+                        s.sensor_code, s.nickname
                     FROM modbus_scada m
                     LEFT JOIN sensors s ON m.sensor_id = s.sensor_id
                     ORDER BY m.id ASC;
@@ -370,15 +381,18 @@ with tab_modbus:
             return pd.DataFrame()
 
     df_modbus = load_modbus_tags()
-    modbus_code_to_id, modbus_id_to_code, modbus_sensor_options = load_sensor_options()
+    modbus_label_to_id, modbus_id_to_label, modbus_sensor_options = load_sensor_options()
 
     st.subheader("📋 Modbus 點位列表（可直接於表格內修改參數）")
     st.caption(
-        "「sensor_code」欄位是要把這個點位綁定到 sensors 階層的哪一個感測器，"
-        "選「（未綁定）」代表不寫入 sensor_readings 時序表。"
+        "「sensor_label」欄位是要把這個點位綁定到 sensors 階層的哪一個感測器，"
+        "顯示格式為「感測器編號（暱稱）」，選「（未綁定）」代表不寫入 sensor_readings 時序表。"
     )
     if not df_modbus.empty:
-        df_modbus["sensor_code"] = df_modbus["sensor_code"].fillna("（未綁定）")
+        df_modbus["sensor_label"] = df_modbus.apply(
+            lambda r: _sensor_label(r["sensor_code"], r["nickname"]), axis=1
+        )
+        df_modbus = df_modbus.drop(columns=["sensor_code", "nickname"])
 
         disabled_cols_modbus = [
             "id",
@@ -394,8 +408,8 @@ with tab_modbus:
             disabled=disabled_cols_modbus,
             width="stretch",
             column_config={
-                "sensor_code": st.column_config.SelectboxColumn(
-                    "sensor_code（綁定感測器）",
+                "sensor_label": st.column_config.SelectboxColumn(
+                    "sensor_label（綁定感測器）",
                     options=modbus_sensor_options,
                     required=True,
                 )
@@ -412,8 +426,8 @@ with tab_modbus:
                                 if isinstance(state_dict_val, dict):
                                     state_dict_val = json.dumps(state_dict_val)
 
-                                selected_code = row.get("sensor_code")
-                                sensor_id_val = modbus_code_to_id.get(selected_code)
+                                selected_label = row.get("sensor_label")
+                                sensor_id_val = modbus_label_to_id.get(selected_label)
 
                                 sql = """
                                 UPDATE modbus_scada SET 
@@ -609,7 +623,7 @@ with tab_tia:
                     query = """
                     SELECT 
                         t.id, t.name, t.plc_name, t.plc_ip, t.db_number, t."offset", t.data_type, 
-                        t.plc_state, t.current_data, t.last_update, s.sensor_code
+                        t.plc_state, t.current_data, t.last_update, s.sensor_code, s.nickname
                     FROM tia_scada t
                     LEFT JOIN sensors s ON t.sensor_id = s.sensor_id
                     ORDER BY t.id ASC;
@@ -623,15 +637,18 @@ with tab_tia:
             return pd.DataFrame()
 
     df_tia = load_tia_tags()
-    tia_code_to_id, tia_id_to_code, tia_sensor_options = load_sensor_options()
+    tia_label_to_id, tia_id_to_label, tia_sensor_options = load_sensor_options()
 
     st.subheader("📋 TIA 點位列表（可直接於表格內修改參數）")
     st.caption(
-        "「sensor_code」欄位是要把這個點位綁定到 sensors 階層的哪一個感測器，"
-        "選「（未綁定）」代表不寫入 sensor_readings 時序表。"
+        "「sensor_label」欄位是要把這個點位綁定到 sensors 階層的哪一個感測器，"
+        "顯示格式為「感測器編號（暱稱）」，選「（未綁定）」代表不寫入 sensor_readings 時序表。"
     )
     if not df_tia.empty:
-        df_tia["sensor_code"] = df_tia["sensor_code"].fillna("（未綁定）")
+        df_tia["sensor_label"] = df_tia.apply(
+            lambda r: _sensor_label(r["sensor_code"], r["nickname"]), axis=1
+        )
+        df_tia = df_tia.drop(columns=["sensor_code", "nickname"])
 
         disabled_cols_tia = ["id", "plc_state", "current_data", "last_update"]
 
@@ -642,8 +659,8 @@ with tab_tia:
             disabled=disabled_cols_tia,
             width="stretch",
             column_config={
-                "sensor_code": st.column_config.SelectboxColumn(
-                    "sensor_code（綁定感測器）",
+                "sensor_label": st.column_config.SelectboxColumn(
+                    "sensor_label（綁定感測器）",
                     options=tia_sensor_options,
                     required=True,
                 )
@@ -656,8 +673,8 @@ with tab_tia:
                     with conn.cursor() as cur:
                         for index, row in edited_tia_df.iterrows():
                             if pd.notnull(row["id"]):
-                                selected_code = row.get("sensor_code")
-                                sensor_id_val = tia_code_to_id.get(selected_code)
+                                selected_label = row.get("sensor_label")
+                                sensor_id_val = tia_label_to_id.get(selected_label)
 
                                 sql = """
                                 UPDATE tia_scada SET 
@@ -798,7 +815,7 @@ with tab_opcua:
                         query = """
                         SELECT o.id, o.server_name, o.node_id, o.browse_name, o.display_name,
                                o.data_type, o.current_data, o.quality, o.plc_state, o.last_update,
-                               s.sensor_code
+                               s.sensor_code, s.nickname
                         FROM opcua_tags o
                         LEFT JOIN sensors s ON o.sensor_id = s.sensor_id
                         WHERE o.server_id = %s ORDER BY o.id ASC;
@@ -808,7 +825,7 @@ with tab_opcua:
                         query = """
                         SELECT o.id, o.server_name, o.node_id, o.browse_name, o.display_name,
                                o.data_type, o.current_data, o.quality, o.plc_state, o.last_update,
-                               s.sensor_code
+                               s.sensor_code, s.nickname
                         FROM opcua_tags o
                         LEFT JOIN sensors s ON o.sensor_id = s.sensor_id
                         ORDER BY o.id ASC;
@@ -885,7 +902,7 @@ with tab_opcua:
         with col1:
             o_server_name = st.text_input("Server 名稱 (server_name)", "OPCUA_Line_A")
             o_ip = st.text_input("IP 位址 (ip)", "192.168.1.100")
-            o_port = st.number_input("Port", value=51210)
+            o_port = st.number_input("Port", value=4840)
             o_username = st.text_input("帳號 (username，留空=匿名連線)", "")
             o_password = st.text_input("密碼 (password)", "", type="password")
 
@@ -1065,12 +1082,15 @@ with tab_opcua:
         df_opcua_tags = load_opcua_tags()
 
     if not df_opcua_tags.empty:
-        opcua_code_to_id, opcua_id_to_code, opcua_sensor_options = load_sensor_options()
-        df_opcua_tags["sensor_code"] = df_opcua_tags["sensor_code"].fillna("（未綁定）")
+        opcua_label_to_id, opcua_id_to_label, opcua_sensor_options = load_sensor_options()
+        df_opcua_tags["sensor_label"] = df_opcua_tags.apply(
+            lambda r: _sensor_label(r["sensor_code"], r["nickname"]), axis=1
+        )
+        df_opcua_tags = df_opcua_tags.drop(columns=["sensor_code", "nickname"])
 
         st.caption(
-            "「sensor_code」欄位是要把這個點位綁定到 sensors 階層的哪一個感測器，"
-            "選「（未綁定）」代表不寫入 sensor_readings 時序表。"
+            "「sensor_label」欄位是要把這個點位綁定到 sensors 階層的哪一個感測器，"
+            "顯示格式為「感測器編號（暱稱）」，選「（未綁定）」代表不寫入 sensor_readings 時序表。"
         )
 
         disabled_cols_opcua_tags = [
@@ -1085,8 +1105,8 @@ with tab_opcua:
             disabled=disabled_cols_opcua_tags,
             width="stretch",
             column_config={
-                "sensor_code": st.column_config.SelectboxColumn(
-                    "sensor_code（綁定感測器）",
+                "sensor_label": st.column_config.SelectboxColumn(
+                    "sensor_label（綁定感測器）",
                     options=opcua_sensor_options,
                     required=True,
                 )
@@ -1098,8 +1118,8 @@ with tab_opcua:
                 with DatabaseConnector.get_connection() as conn:
                     with conn.cursor() as cur:
                         for index, row in edited_opcua_tags_df.iterrows():
-                            selected_code = row.get("sensor_code")
-                            sensor_id_val = opcua_code_to_id.get(selected_code)
+                            selected_label = row.get("sensor_label")
+                            sensor_id_val = opcua_label_to_id.get(selected_label)
                             cur.execute(
                                 "UPDATE opcua_tags SET sensor_id=%s WHERE id=%s;",
                                 (sensor_id_val, int(row["id"])),
@@ -1317,8 +1337,8 @@ with tab_hierarchy:
     st.subheader("🌡️ 感測器 (sensors)")
     df_sensors_full = _fetch_df(
         """
-        SELECT se.sensor_id, d.device_code, se.sensor_code, se.sensor_type,
-               se.unit, se.min_threshold, se.max_threshold, se.device_id
+        SELECT se.sensor_id, d.device_code, se.sensor_code, se.nickname, se.sensor_type,
+               se.unit, se.min_threshold, se.max_threshold, se.state_dictionary, se.device_id
         FROM sensors se
         LEFT JOIN devices d ON se.device_id = d.device_id
         ORDER BY se.sensor_id ASC;
@@ -1329,14 +1349,77 @@ with tab_hierarchy:
         for _, row in df_devices.iterrows()
     } if not df_devices.empty else {}
 
+    st.caption(
+        "可直接在下方表格編輯「nickname」等欄位，方便日後對照識別（例如中文說明、位置等）。"
+        "「state_dictionary」是選填的狀態字典（JSON 格式，例如 {\"1\": \"待機\", \"2\": \"運轉\"}），"
+        "設定後查詢 sensor_readings_translated 這個 view 就會自動把數字翻譯成文字。"
+    )
     if not df_sensors_full.empty:
-        st.dataframe(
-            df_sensors_full[[
-                "sensor_id", "device_code", "sensor_code", "sensor_type",
-                "unit", "min_threshold", "max_threshold",
-            ]],
-            width="stretch",
+        df_sensors_full["state_dictionary"] = df_sensors_full["state_dictionary"].apply(
+            lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, dict) else v
         )
+
+        edited_sensors_df = st.data_editor(
+            df_sensors_full[[
+                "sensor_id", "device_code", "sensor_code", "nickname", "sensor_type",
+                "unit", "min_threshold", "max_threshold", "state_dictionary",
+            ]],
+            num_rows="fixed",
+            key="sensors_editor",
+            disabled=["sensor_id", "device_code", "sensor_code"],
+            width="stretch",
+            column_config={
+                "state_dictionary": st.column_config.TextColumn(
+                    "state_dictionary（選填，JSON 格式）",
+                    help='例如：{"1": "待機", "2": "運轉"}',
+                )
+            },
+        )
+
+        if st.button("💾 儲存感測器修改", key="save_sensors"):
+            try:
+                with DatabaseConnector.get_connection() as conn:
+                    with conn.cursor() as cur:
+                        for _, row in edited_sensors_df.iterrows():
+                            state_dict_raw = row["state_dictionary"]
+                            state_dict_val = None
+                            if pd.notnull(state_dict_raw) and str(state_dict_raw).strip():
+                                try:
+                                    # 驗證是合法 JSON，並統一存成 JSON 字串
+                                    state_dict_val = json.dumps(
+                                        json.loads(str(state_dict_raw)), ensure_ascii=False
+                                    )
+                                except json.JSONDecodeError:
+                                    st.error(
+                                        f"❌ sensor_id={int(row['sensor_id'])} 的 "
+                                        f"state_dictionary 不是合法 JSON，該筆未儲存：{state_dict_raw}"
+                                    )
+                                    continue
+
+                            cur.execute(
+                                """
+                                UPDATE sensors SET
+                                    nickname=%s, sensor_type=%s, unit=%s,
+                                    min_threshold=%s, max_threshold=%s, state_dictionary=%s
+                                WHERE sensor_id=%s;
+                                """,
+                                (
+                                    row["nickname"].strip()
+                                    if pd.notnull(row["nickname"]) and str(row["nickname"]).strip()
+                                    else None,
+                                    row["sensor_type"],
+                                    row["unit"],
+                                    float(row["min_threshold"]) if pd.notnull(row["min_threshold"]) else None,
+                                    float(row["max_threshold"]) if pd.notnull(row["max_threshold"]) else None,
+                                    state_dict_val,
+                                    int(row["sensor_id"]),
+                                ),
+                            )
+                        conn.commit()
+                st.success("✅ 感測器資料更新成功！")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ 儲存失敗: {e}")
     else:
         st.info("目前尚無任何感測器，請在下方新增。新增後即可回到點位設定分頁進行綁定。")
 
@@ -1345,6 +1428,7 @@ with tab_hierarchy:
         "temperature", "pressure", "vibration", "current", "voltage",
         "power", "energy", "flow", "level", "humidity", "speed",
         "torque", "position", "ph", "conductivity", "weight", "count", "status",
+        "gas", "liquid", "solid",
         "其他（自訂）",
     ]
 
@@ -1361,6 +1445,7 @@ with tab_hierarchy:
         "g", "kg", "t",
         "N", "Nm",
         "pH", "μS/cm",
+        "kg/cm²", "kg/m²", "mmHg", "inHg",
         "count",
         "其他（自訂）",
     ]
@@ -1374,6 +1459,9 @@ with tab_hierarchy:
                 new_sensor_device = None
                 st.warning("⚠️ 請先新增設備")
             new_sensor_code = st.text_input("感測器編號 (sensor_code，唯一)", "")
+            new_sensor_nickname = st.text_input(
+                "暱稱 (nickname，選填)", "", placeholder="例如：B03 蒸氣流量計"
+            )
         with col2:
             new_sensor_type_selected = st.selectbox(
                 "感測器類型 (sensor_type)", SENSOR_TYPE_OPTIONS, index=0
@@ -1395,7 +1483,12 @@ with tab_hierarchy:
             )
         with col3:
             new_sensor_min = st.number_input("正常值下限 (min_threshold)", value=0.0)
-            new_sensor_max = st.number_input("正常值上限 (max_threshold)", value=100.0)
+            new_sensor_max = st.number_input("正常值上限 (max_threshold)", value=10000.0)
+            new_sensor_state_dict = st.text_input(
+                "狀態字典 JSON (state_dictionary，選填)",
+                value="",
+                placeholder='{"1": "待機", "2": "運轉"}',
+            )
         if st.form_submit_button("➕ 新增感測器", type="primary"):
             final_sensor_type = (
                 new_sensor_type_custom.strip()
@@ -1407,23 +1500,39 @@ with tab_hierarchy:
                 if new_sensor_unit_selected == "其他（自訂）"
                 else new_sensor_unit_selected
             )
-            if new_sensor_code.strip() and new_sensor_device and final_sensor_type:
+            formatted_state_dict = None
+            state_dict_error = False
+            if new_sensor_state_dict.strip():
+                try:
+                    formatted_state_dict = json.dumps(
+                        json.loads(new_sensor_state_dict), ensure_ascii=False
+                    )
+                except json.JSONDecodeError:
+                    state_dict_error = True
+                    st.error("❌ 狀態字典格式錯誤！請填寫合法的 JSON 格式")
+
+            if state_dict_error:
+                pass
+            elif new_sensor_code.strip() and new_sensor_device and final_sensor_type:
                 try:
                     with DatabaseConnector.get_connection() as conn:
                         with conn.cursor() as cur:
                             cur.execute(
                                 """
                                 INSERT INTO sensors
-                                    (device_id, sensor_code, sensor_type, unit, min_threshold, max_threshold)
-                                VALUES (%s, %s, %s, %s, %s, %s);
+                                    (device_id, sensor_code, nickname, sensor_type, unit,
+                                     min_threshold, max_threshold, state_dictionary)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
                                 """,
                                 (
                                     device_options[new_sensor_device],
                                     new_sensor_code.strip(),
+                                    new_sensor_nickname.strip() or None,
                                     final_sensor_type,
                                     final_sensor_unit or None,
                                     new_sensor_min,
                                     new_sensor_max,
+                                    formatted_state_dict,
                                 ),
                             )
                             conn.commit()
@@ -1433,3 +1542,137 @@ with tab_hierarchy:
                     st.error(f"❌ 新增失敗（sensor_code 需為唯一值）: {e}")
             else:
                 st.warning("⚠️ 請輸入感測器編號並選擇所屬設備")
+
+
+# ==========================================
+# Tab 5: 異常監控（連線異常 + 閾值超標 + 資料斷更）
+# ==========================================
+with tab_alerts:
+    st.header("🚨 異常監控")
+    st.caption(
+        "這個分頁彙整三種常見的「點位異常」，不用自己下 SQL 一個一個查。"
+    )
+
+    # ------------------------------------------------------------
+    # 1. 連線異常：即時層三張表裡 plc_state 不是 ONLINE 的點位
+    # ------------------------------------------------------------
+    st.subheader("🔌 連線異常（plc_state ≠ ONLINE）")
+    st.caption("代表這個點位上一輪採集時 PLC/Server 連不上，或讀取/解析失敗。")
+
+    df_offline = _fetch_df(
+        """
+        SELECT 'Modbus' AS 來源, id, name AS 點位名稱, plc_ip, plc_state, last_update::text AS last_update
+        FROM modbus_scada WHERE plc_state IS DISTINCT FROM 'ONLINE'
+        UNION ALL
+        SELECT 'TIA/S7', id, name, plc_ip, plc_state, last_update::text
+        FROM tia_scada WHERE plc_state IS DISTINCT FROM 'ONLINE'
+        UNION ALL
+        SELECT 'OPC UA', id, node_id, server_name, plc_state, last_update::text
+        FROM opcua_tags WHERE plc_state IS DISTINCT FROM 'ONLINE'
+        ORDER BY 來源, id;
+        """
+    )
+    if not df_offline.empty:
+        st.error(f"⚠️ 目前有 {len(df_offline)} 個點位連線異常")
+        st.dataframe(df_offline, width="stretch")
+    else:
+        st.success("✅ 目前所有點位連線狀態正常")
+
+    st.divider()
+
+    # ------------------------------------------------------------
+    # 2. 數值超出正常範圍（依 sensors.min_threshold / max_threshold）
+    # ------------------------------------------------------------
+    st.subheader("📈 數值超出正常範圍")
+    st.caption(
+        "依每個感測器在 sensors 表設定的 min_threshold / max_threshold，"
+        "比對 sensor_readings 裡最新一筆數值。僅涵蓋已綁定 sensor_id 的點位。"
+    )
+
+    df_out_of_range = _fetch_df(
+        """
+        SELECT
+            s.sensor_code,
+            s.nickname,
+            s.sensor_type,
+            r.value AS 目前數值,
+            s.min_threshold AS 下限,
+            s.max_threshold AS 上限,
+            s.unit,
+            r.reading_time AS 讀取時間
+        FROM sensors s
+        JOIN LATERAL (
+            SELECT value, reading_time
+            FROM sensor_readings
+            WHERE sensor_id = s.sensor_id
+            ORDER BY reading_time DESC
+            LIMIT 1
+        ) r ON true
+        WHERE (s.min_threshold IS NOT NULL AND r.value < s.min_threshold)
+           OR (s.max_threshold IS NOT NULL AND r.value > s.max_threshold)
+        ORDER BY r.reading_time DESC;
+        """
+    )
+    if not df_out_of_range.empty:
+        st.error(f"⚠️ 目前有 {len(df_out_of_range)} 個感測器數值超出正常範圍")
+        st.dataframe(df_out_of_range, width="stretch")
+    else:
+        st.success("✅ 目前所有已綁定感測器的數值都在正常範圍內")
+
+    st.divider()
+
+    # ------------------------------------------------------------
+    # 3. 資料斷更（超過 N 小時沒有新的 sensor_readings）
+    # ------------------------------------------------------------
+    st.subheader("⏱️ 資料斷更（疑似離線）")
+    stale_hours = st.number_input(
+        "判定為「太久沒更新」的時數門檻（小時）", min_value=1, value=2, step=1
+    )
+    st.caption(
+        "正常情況下，就算數值沒變化，系統也會依心跳週期定期補寫一筆進 sensor_readings。"
+        "如果一個已綁定的感測器超過這個時數都沒有任何新資料，通常代表該點位已經斷線、"
+        "或是採集程式沒有正常執行。"
+    )
+
+    df_stale = _fetch_df(
+        f"""
+        SELECT
+            s.sensor_code,
+            s.nickname,
+            s.sensor_type,
+            r.reading_time AS 最後讀取時間,
+            r.value AS 最後數值,
+            now() - r.reading_time AS 已斷更多久
+        FROM sensors s
+        JOIN LATERAL (
+            SELECT value, reading_time
+            FROM sensor_readings
+            WHERE sensor_id = s.sensor_id
+            ORDER BY reading_time DESC
+            LIMIT 1
+        ) r ON true
+        WHERE r.reading_time < now() - INTERVAL '{int(stale_hours)} hours'
+        ORDER BY r.reading_time ASC;
+        """
+    )
+    df_never = _fetch_df(
+        """
+        SELECT s.sensor_code, s.nickname, s.sensor_type
+        FROM sensors s
+        LEFT JOIN sensor_readings r ON r.sensor_id = s.sensor_id
+        WHERE r.sensor_id IS NULL;
+        """
+    )
+
+    if not df_stale.empty:
+        st.error(f"⚠️ 有 {len(df_stale)} 個感測器超過 {stale_hours} 小時沒有新資料")
+        st.dataframe(df_stale, width="stretch")
+    else:
+        st.success(f"✅ 目前沒有感測器斷更超過 {stale_hours} 小時")
+
+    if not df_never.empty:
+        st.warning(
+            f"ℹ️ 另外有 {len(df_never)} 個感測器從建立以來「從未」寫入過 sensor_readings"
+            "（可能是尚未綁定對應點位，或該點位一直讀取失敗）："
+        )
+        st.dataframe(df_never, width="stretch")
