@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import json
 import os
 import struct
@@ -46,6 +47,48 @@ try:
     OPCUA_AVAILABLE = True
 except ImportError:
     OPCUA_AVAILABLE = False
+
+
+# ------------------------------------------------------------------
+# Helper: 正規化 state_dictionary 欄位（相容合法 JSON 與 Python 字典字面量）
+# ------------------------------------------------------------------
+def _normalize_state_dict(raw):
+    """
+    表格編輯器顯示 JSONB 欄位時，可能把它渲染成 Python 字典字面量
+    （單引號，例如 {'0': '待機'}），使用者存檔時若沒有改回合法 JSON
+    （雙引號），直接丟給 PostgreSQL 會報錯：invalid input syntax for type json。
+
+    這裡統一嘗試三種來源並正規化成合法 JSON 字串：
+      1. 已經是 dict 物件（psycopg2 讀出 JSONB 欄位時的預設型態）
+      2. 合法 JSON 字串（雙引號）
+      3. Python 字典字面量字串（單引號）
+
+    回傳 (json_str_or_None, error_message_or_None)。
+    空值（None / 空字串 / 空 dict）視為「不設定」，回傳 (None, None)。
+    """
+    if raw is None:
+        return None, None
+    if isinstance(raw, dict):
+        if not raw:
+            return None, None
+        return json.dumps(raw, ensure_ascii=False), None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None, None
+        try:
+            parsed = json.loads(s)
+            return json.dumps(parsed, ensure_ascii=False), None
+        except json.JSONDecodeError:
+            pass
+        try:
+            parsed = ast.literal_eval(s)
+            if isinstance(parsed, dict):
+                return (json.dumps(parsed, ensure_ascii=False), None) if parsed else (None, None)
+        except (ValueError, SyntaxError):
+            pass
+        return None, f"無法解析為合法 JSON 或字典：{s}"
+    return None, f"不支援的型態：{type(raw).__name__}"
 
 
 # ------------------------------------------------------------------
@@ -422,9 +465,15 @@ with tab_modbus:
                     with conn.cursor() as cur:
                         for index, row in edited_modbus_df.iterrows():
                             if pd.notnull(row["id"]):
-                                state_dict_val = row["state_dictionary"]
-                                if isinstance(state_dict_val, dict):
-                                    state_dict_val = json.dumps(state_dict_val)
+                                state_dict_val, state_dict_err = _normalize_state_dict(
+                                    row["state_dictionary"]
+                                )
+                                if state_dict_err:
+                                    st.error(
+                                        f"❌ id={int(row['id'])} 的 state_dictionary 格式錯誤，"
+                                        f"該筆未儲存：{state_dict_err}"
+                                    )
+                                    continue
 
                                 selected_label = row.get("sensor_label")
                                 sensor_id_val = modbus_label_to_id.get(selected_label)
@@ -462,9 +511,7 @@ with tab_modbus:
                                         else None,
                                         row["byte_order"],
                                         row["word_order"],
-                                        state_dict_val
-                                        if pd.notnull(state_dict_val)
-                                        else None,
+                                        state_dict_val,
                                         sensor_id_val,
                                         int(row["id"]),
                                     ),
@@ -1381,20 +1428,15 @@ with tab_hierarchy:
                 with DatabaseConnector.get_connection() as conn:
                     with conn.cursor() as cur:
                         for _, row in edited_sensors_df.iterrows():
-                            state_dict_raw = row["state_dictionary"]
-                            state_dict_val = None
-                            if pd.notnull(state_dict_raw) and str(state_dict_raw).strip():
-                                try:
-                                    # 驗證是合法 JSON，並統一存成 JSON 字串
-                                    state_dict_val = json.dumps(
-                                        json.loads(str(state_dict_raw)), ensure_ascii=False
-                                    )
-                                except json.JSONDecodeError:
-                                    st.error(
-                                        f"❌ sensor_id={int(row['sensor_id'])} 的 "
-                                        f"state_dictionary 不是合法 JSON，該筆未儲存：{state_dict_raw}"
-                                    )
-                                    continue
+                            state_dict_val, state_dict_err = _normalize_state_dict(
+                                row["state_dictionary"]
+                            )
+                            if state_dict_err:
+                                st.error(
+                                    f"❌ sensor_id={int(row['sensor_id'])} 的 "
+                                    f"state_dictionary 格式錯誤，該筆未儲存：{state_dict_err}"
+                                )
+                                continue
 
                             cur.execute(
                                 """
@@ -1445,7 +1487,6 @@ with tab_hierarchy:
         "g", "kg", "t",
         "N", "Nm",
         "pH", "μS/cm",
-        "kg/cm²", "kg/m²", "mmHg", "inHg",
         "count",
         "其他（自訂）",
     ]
@@ -1483,7 +1524,7 @@ with tab_hierarchy:
             )
         with col3:
             new_sensor_min = st.number_input("正常值下限 (min_threshold)", value=0.0)
-            new_sensor_max = st.number_input("正常值上限 (max_threshold)", value=10000.0)
+            new_sensor_max = st.number_input("正常值上限 (max_threshold)", value=100.0)
             new_sensor_state_dict = st.text_input(
                 "狀態字典 JSON (state_dictionary，選填)",
                 value="",
