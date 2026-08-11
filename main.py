@@ -4,6 +4,7 @@ import time
 import signal
 import logging
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 # 強制抓取 main.py 所在目錄的 .env
@@ -27,14 +28,14 @@ except ValueError:
 
 # 匯入 DB 與 MQTT 模組
 from data_layer.db_connector import DatabaseConnector
-from data_layer.timeseries_writer import sensor_reading_writer
 from messaging.mqtt_publisher import MQTTPublisher
 
 # 匯入採集模組
+# 🔥 注意：OPC UA 不再放進每輪的併發採集，改由常駐的訂閱服務處理（見下方）
 try:
     from collector.run_modbus_collector import main as run_modbus_collector
     from collector.run_s7_collector import collect_s7_data as run_tia_collector
-    from collector.run_opcua_collector import collect_opcua_data as run_opcua_collector
+    from services.opcua_subscription_service import OPCUASubscriptionService
 except ImportError as e:
     logging.error(f"❌ 匯入採集模組失敗: {e}")
     sys.exit(1)
@@ -49,6 +50,32 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+
+# ----------------------------------------------------
+# 🚀 Modbus / TIA 併發執行：兩協議各自跑在獨立執行緒，
+#    任一個整體卡住（例如該協議下所有設備都離線在等 timeout），
+#    也不會拖到另一個協議完全沒開始採集。
+#    （OPC UA 已改為常駐訂閱服務，不在此併發清單內）
+# ----------------------------------------------------
+def run_collectors_concurrently():
+    tasks = {
+        "Modbus": run_modbus_collector,
+        "TIA(S7)": run_tia_collector,
+    }
+
+    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+        future_to_name = {
+            executor.submit(func): name for name, func in tasks.items()
+        }
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                future.result()
+                logging.info(f"✅ [{name}] 採集完成")
+            except Exception as e:
+                logging.error(f"❌ [{name}] 採集過程發生例外: {e}", exc_info=True)
+
 
 def _safe_parse_val(val):
     """安全解析點位值：數字自動轉 float/int，中文狀態字串原樣保留"""
@@ -119,22 +146,18 @@ def main():
         logging.error("❌ PostgreSQL 連線池初始化失敗，主服務無法啟動！")
         return
 
-    # 1.1 載入 sensor_readings 心跳快取（避免服務重啟後心跳判斷從頭算）
-    sensor_reading_writer.load_initial_cache()
-
     # 2. 初始化 MQTT Publisher
     mqtt_pub = None
-    mqtt_enabled = os.getenv("MQTT_ENABLED", "true").strip().lower() != "false"
+    try:
+        mqtt_pub = MQTTPublisher()
+    except Exception as e:
+        logging.error(f"⚠️ MQTT 客戶端初始化失敗: {e}")
 
-    if mqtt_enabled:
-        try:
-            mqtt_pub = MQTTPublisher()
-        except Exception as e:
-            logging.error(f"⚠️ MQTT 客戶端初始化失敗: {e}")
-    else:
-        logging.info("🔕 MQTT 上傳功能已停用 (MQTT_ENABLED=false)")
+    # 3. 啟動 OPC UA 訂閱服務（獨立背景執行緒，跟下方主迴圈完全脫鉤）
+    opcua_service = OPCUASubscriptionService()
+    opcua_service.start()
 
-    logging.info(f"⏱️ 當前設定採集週期: {POLL_INTERVAL} 秒")
+    logging.info(f"⏱️ 當前設定採集週期: {POLL_INTERVAL} 秒 (僅套用於 Modbus / TIA)")
     cycle_count = 0
 
     try:
@@ -143,46 +166,21 @@ def main():
             start_time = time.time()
             logging.info(f"\n================ 🔄 第 {cycle_count} 輪採集開始 ================")
 
-            # 步驟 1: 執行 Modbus 採集
-            try:
-                logging.info("📡 [1/4] 正在執行 Modbus 採集...")
-                run_modbus_collector()
-            except Exception as e:
-                logging.error(f"❌ Modbus 採集過程發生例外: {e}")
+            # 步驟 1: 併發執行 Modbus / TIA (S7) 採集
+            # （OPC UA 由常駐訂閱服務在背景持續處理，不佔用本迴圈時間）
+            logging.info("📡 [1/2] 併發執行 Modbus / TIA(S7) 採集...")
+            run_collectors_concurrently()
 
-            # 步驟 2: 執行 TIA (S7) 採集
-            try:
-                logging.info("📡 [2/4] 正在執行 TIA (S7) 採集...")
-                run_tia_collector()
-            except Exception as e:
-                logging.error(f"❌ TIA 採集過程發生例外: {e}")
-
-            # 步驟 3: 執行 OPC UA 採集
-            # 注意：OPC UA 每輪都要重新瀏覽整個 Address Space，若點位很多、
-            # 週期設定又短，這步可能會拖慢整輪採集時間。如果發現這步耗時
-            # 過長，可以考慮：
-            #   (a) 在 opcua_servers 把 browse_depth 調小、root_node_id 指到
-            #       更精準的節點，縮小每次瀏覽範圍
-            #   (b) 改成獨立的排程週期（例如額外用 OPCUA_POLL_INTERVAL
-            #       另外跑一個迴圈），不要跟 Modbus/TIA 共用同一個 POLL_INTERVAL
-            #   (c) 平常倚賴 admin_app.py 網頁上的「手動瀏覽」按鈕來即時抓取，
-            #       這裡的排程只作為備援全量更新
-            try:
-                logging.info("📡 [3/4] 正在執行 OPC UA 採集...")
-                run_opcua_collector()
-            except Exception as e:
-                logging.error(f"❌ OPC UA 採集過程發生例外: {e}")
-
-            # 步驟 4: 抓取 DB 最新點位並進行 MQTT 增量上傳
+            # 步驟 2: 抓取 DB 最新點位並進行 MQTT 增量上傳
             if mqtt_pub:
                 try:
-                    logging.info("📤 [4/4] 正在執行 MQTT 增量上傳...")
+                    logging.info("📤 [2/2] 正在執行 MQTT 增量上傳...")
                     current_scada_data = fetch_latest_scada_map()
                     mqtt_pub.publish_incremental(current_scada_data)
                 except Exception as e:
                     logging.error(f"❌ MQTT 發送過程發生例外: {e}")
 
-            # 步驟 5: 計算動態休眠時間
+            # 步驟 3: 計算動態休眠時間
             elapsed_time = time.time() - start_time
             sleep_time = max(0.0, POLL_INTERVAL - elapsed_time)
 
@@ -197,10 +195,11 @@ def main():
         logging.error(f"💥 主迴圈發生未預期的例外: {main_err}", exc_info=True)
     finally:
         # 安全關閉資源
+        opcua_service.stop()
         if mqtt_pub:
             mqtt_pub.close()
         DatabaseConnector.close_pool()
-        logging.info("👋 已安全關閉 MQTT 與 DB 連線池，主程式退出。")
+        logging.info("👋 已安全關閉 OPC UA 訂閱服務、MQTT 與 DB 連線池，主程式退出。")
 
 
 if __name__ == "__main__":

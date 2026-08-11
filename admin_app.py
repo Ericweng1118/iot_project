@@ -48,7 +48,6 @@ try:
 except ImportError:
     OPCUA_AVAILABLE = False
 
-
 # ------------------------------------------------------------------
 # Helper: 正規化 state_dictionary 欄位（相容合法 JSON 與 Python 字典字面量）
 # ------------------------------------------------------------------
@@ -89,8 +88,6 @@ def _normalize_state_dict(raw):
             pass
         return None, f"無法解析為合法 JSON 或字典：{s}"
     return None, f"不支援的型態：{type(raw).__name__}"
-
-
 # ------------------------------------------------------------------
 # Helper: 身份驗證機制 (Login Mechanism)
 # ------------------------------------------------------------------
@@ -322,6 +319,115 @@ def run_async(coro):
     return asyncio.run(coro)
 
 
+def _fetch_df(query):
+    """
+    通用查詢 helper：執行任意 SELECT 並回傳 DataFrame。
+    給「感測器階層管理」與「異常監控」兩個分頁共用。
+    """
+    try:
+        with DatabaseConnector.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                cols = [desc[0] for desc in cur.description]
+                rows = cur.fetchall()
+                return pd.DataFrame(rows, columns=cols)
+    except Exception as e:
+        st.error(f"查詢失敗: {e}")
+        return pd.DataFrame()
+
+
+def _load_sensor_options():
+    """
+    載入所有感測器選項，供 Modbus / TIA / OPC UA 三個分頁的
+    sensor_code 綁定下拉選單使用。
+    回傳:
+        label_to_id: dict，顯示字串 -> sensor_id
+        id_to_label: dict，sensor_id -> 顯示字串
+    顯示字串格式："設備編號 / 感測器編號 (暱稱)"，沒有暱稱則省略括號部分。
+    """
+    df = _fetch_df(
+        """
+        SELECT se.sensor_id, d.device_code, se.sensor_code, se.nickname
+        FROM sensors se
+        JOIN devices d ON se.device_id = d.device_id
+        ORDER BY d.device_code, se.sensor_code;
+        """
+    )
+    label_to_id = {}
+    id_to_label = {}
+    for _, row in df.iterrows():
+        label = f"{row['device_code']} / {row['sensor_code']}"
+        if pd.notnull(row["nickname"]) and str(row["nickname"]).strip():
+            label += f" ({row['nickname']})"
+        sid = int(row["sensor_id"])
+        label_to_id[label] = sid
+        id_to_label[sid] = label
+    return label_to_id, id_to_label
+
+
+UNBOUND_LABEL = "（未綁定）"
+
+
+def _load_sensor_binding_map():
+    """
+    一次撈出目前 Modbus / TIA / OPC UA 三張表裡所有『已綁定感測器』的點位，
+    用來做跨協議重複綁定偵測（避免同一個 sensor_id 被兩個不同點位同時綁定）。
+    回傳: dict，sensor_id -> [(table_name, point_id, point_display_name), ...]
+    """
+    mapping = {}
+    checks = [
+        ("modbus_scada", "id", "name"),
+        ("tia_scada", "id", "name"),
+        ("opcua_tags", "id", "node_id"),
+    ]
+    for table, id_col, name_col in checks:
+        df = _fetch_df(
+            f"SELECT {id_col} AS pid, {name_col} AS pname, sensor_id "
+            f"FROM {table} WHERE sensor_id IS NOT NULL;"
+        )
+        for _, r in df.iterrows():
+            sid = int(r["sensor_id"])
+            mapping.setdefault(sid, []).append(
+                (table, int(r["pid"]), str(r["pname"]))
+            )
+    return mapping
+
+
+def _find_binding_conflict(binding_map, sensor_id, table, point_id):
+    """
+    檢查 sensor_id 是否已被【其他】點位綁定，回傳衝突描述字串；沒有衝突則回傳 None。
+    :param table: 目前正在儲存的表名 ('modbus_scada' / 'tia_scada' / 'opcua_tags')
+    :param point_id: 目前這筆點位自己的 id（用來排除自己，new 筆傳 None）
+    """
+    if sensor_id is None:
+        return None
+    others = [
+        f"{t}.{pid}（{name}）"
+        for t, pid, name in binding_map.get(sensor_id, [])
+        if not (t == table and pid == point_id)
+    ]
+    return "、".join(others) if others else None
+
+
+def request_opcua_resubscribe(server_id: int):
+    """
+    通知常駐的 OPC UA 訂閱服務：該 Server 的點位表已更新，
+    請重新瀏覽並更新訂閱內容。
+    做法很單純：把 opcua_servers.resubscribe_requested 設為 TRUE，
+    main.py 背景執行的訂閱服務會每隔幾秒輪詢這個旗標，
+    偵測到後自動重新整理，不需要重啟任何服務。
+    """
+    try:
+        with DatabaseConnector.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE opcua_servers SET resubscribe_requested = TRUE WHERE id = %s;",
+                    (int(server_id),),
+                )
+    except Exception as e:
+        st.warning(f"⚠️ 通知訂閱服務重新整理失敗（不影響本次寫入結果）: {e}")
+
+
 # ==========================================
 # 主頁面配置與登入檢查
 # ==========================================
@@ -359,42 +465,6 @@ tab_modbus, tab_tia, tab_opcua, tab_hierarchy, tab_alerts = st.tabs(
 )
 
 
-# ------------------------------------------------------------------
-# Helper: 讀取目前所有 sensors（給下拉選單、綁定用）
-# ------------------------------------------------------------------
-def _sensor_label(sensor_code, nickname):
-    """組合下拉選單顯示用的標籤：有暱稱就顯示「代號（暱稱）」，沒有就只顯示代號"""
-    if sensor_code is None or (isinstance(sensor_code, float) and pd.isna(sensor_code)):
-        return "（未綁定）"
-    if nickname and str(nickname).strip() and str(nickname).strip().lower() != "nan":
-        return f"{sensor_code}（{nickname}）"
-    return str(sensor_code)
-
-
-def load_sensor_options():
-    """回傳 label -> sensor_id 對照表，以及供下拉選單使用的清單
-    label 格式為「sensor_code（nickname）」，方便對照識別；沒有 nickname 則只顯示 sensor_code。
-    """
-    try:
-        with DatabaseConnector.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT sensor_id, sensor_code, nickname, sensor_type, unit
-                    FROM sensors
-                    ORDER BY sensor_code ASC;
-                    """
-                )
-                rows = cur.fetchall()
-        label_to_id = {_sensor_label(r[1], r[2]): r[0] for r in rows}
-        id_to_label = {r[0]: _sensor_label(r[1], r[2]) for r in rows}
-        display_options = ["（未綁定）"] + list(label_to_id.keys())
-        return label_to_id, id_to_label, display_options
-    except Exception as e:
-        st.error(f"無法讀取 sensors 清單: {e}")
-        return {}, {}, ["（未綁定）"]
-
-
 # ==========================================
 # Tab 1: Modbus 點位 CRUD
 # ==========================================
@@ -407,13 +477,11 @@ with tab_modbus:
                 with conn.cursor() as cur:
                     query = """
                     SELECT 
-                        m.id, m.name, m.plc_ip, m.plc_port, m.slave_id, m.function_code, m.start_address, 
-                        m.data_type, m.raw_min, m.raw_max, m.eng_min, m.eng_max, m.byte_order, m.word_order,
-                        m.state_dictionary, m.plc_state, m.current_value, m.current_data, m.unit, m.last_update,
-                        s.sensor_code, s.nickname
-                    FROM modbus_scada m
-                    LEFT JOIN sensors s ON m.sensor_id = s.sensor_id
-                    ORDER BY m.id ASC;
+                        id, name, plc_ip, plc_port, slave_id, function_code, start_address, 
+                        data_type, raw_min, raw_max, eng_min, eng_max, byte_order, word_order,
+                        state_dictionary, sensor_id, plc_state, current_value,current_data,unit, last_update
+                    FROM modbus_scada 
+                    ORDER BY id ASC;
                     """
                     cur.execute(query)
                     cols = [desc[0] for desc in cur.description]
@@ -424,18 +492,18 @@ with tab_modbus:
             return pd.DataFrame()
 
     df_modbus = load_modbus_tags()
-    modbus_label_to_id, modbus_id_to_label, modbus_sensor_options = load_sensor_options()
+    modbus_label_to_id, modbus_id_to_label = _load_sensor_options()
 
     st.subheader("📋 Modbus 點位列表（可直接於表格內修改參數）")
-    st.caption(
-        "「sensor_label」欄位是要把這個點位綁定到 sensors 階層的哪一個感測器，"
-        "顯示格式為「感測器編號（暱稱）」，選「（未綁定）」代表不寫入 sensor_readings 時序表。"
-    )
     if not df_modbus.empty:
-        df_modbus["sensor_label"] = df_modbus.apply(
-            lambda r: _sensor_label(r["sensor_code"], r["nickname"]), axis=1
+        # 把 sensor_id 轉成人類可讀的 sensor_label 欄位，供下拉選單編輯，
+        # 存檔時再反查回 sensor_id。
+        df_modbus["sensor_label"] = df_modbus["sensor_id"].apply(
+            lambda sid: modbus_id_to_label.get(int(sid), UNBOUND_LABEL)
+            if pd.notnull(sid)
+            else UNBOUND_LABEL
         )
-        df_modbus = df_modbus.drop(columns=["sensor_code", "nickname"])
+        df_modbus_display = df_modbus.drop(columns=["sensor_id"])
 
         disabled_cols_modbus = [
             "id",
@@ -445,38 +513,56 @@ with tab_modbus:
         ]
 
         edited_modbus_df = st.data_editor(
-            df_modbus,
+            df_modbus_display,
             num_rows="dynamic",
             key="modbus_editor",
             disabled=disabled_cols_modbus,
             width="stretch",
             column_config={
                 "sensor_label": st.column_config.SelectboxColumn(
-                    "sensor_label（綁定感測器）",
-                    options=modbus_sensor_options,
-                    required=True,
+                    "綁定感測器 (sensor_code)",
+                    options=[UNBOUND_LABEL] + list(modbus_label_to_id.keys()),
+                    help="選擇這個點位對應的感測器，數值會同步寫入 sensor_readings 時序表。"
+                    "選單內容請先在「感測器階層管理」分頁建立。",
                 )
             },
         )
 
         if st.button("💾 儲存 Modbus 修改", type="primary"):
+            binding_map = _load_sensor_binding_map()
             try:
                 with DatabaseConnector.get_connection() as conn:
                     with conn.cursor() as cur:
                         for index, row in edited_modbus_df.iterrows():
                             if pd.notnull(row["id"]):
+                                point_id = int(row["id"])
+
                                 state_dict_val, state_dict_err = _normalize_state_dict(
                                     row["state_dictionary"]
                                 )
                                 if state_dict_err:
                                     st.error(
-                                        f"❌ id={int(row['id'])} 的 state_dictionary 格式錯誤，"
-                                        f"該筆未儲存：{state_dict_err}"
+                                        f"❌ id={point_id} 的 "
+                                        f"state_dictionary 格式錯誤，該筆未儲存：{state_dict_err}"
                                     )
                                     continue
 
-                                selected_label = row.get("sensor_label")
-                                sensor_id_val = modbus_label_to_id.get(selected_label)
+                                sensor_label = row.get("sensor_label", UNBOUND_LABEL)
+                                sensor_id = (
+                                    modbus_label_to_id.get(sensor_label)
+                                    if sensor_label != UNBOUND_LABEL
+                                    else None
+                                )
+                                conflict = _find_binding_conflict(
+                                    binding_map, sensor_id, "modbus_scada", point_id
+                                )
+                                if conflict:
+                                    st.error(
+                                        f"❌ id={point_id}（{row['name']}）想綁定的感測器"
+                                        f"已被其他點位使用：{conflict}，該筆未儲存。"
+                                        "同一個感測器不能同時綁定多個點位。"
+                                    )
+                                    continue
 
                                 sql = """
                                 UPDATE modbus_scada SET 
@@ -511,9 +597,9 @@ with tab_modbus:
                                         else None,
                                         row["byte_order"],
                                         row["word_order"],
-                                        state_dict_val,
-                                        sensor_id_val,
-                                        int(row["id"]),
+                                        state_dict_val,  # 已由 _normalize_state_dict 正規化為合法 JSON 字串或 None
+                                        sensor_id,
+                                        point_id,
                                     ),
                                 )
                         conn.commit()
@@ -580,6 +666,11 @@ with tab_modbus:
                 value="",
                 placeholder='{"1": "待機", "2": "運轉"}',
             )
+            m_sensor_label = st.selectbox(
+                "綁定感測器 (sensor_code，可留空)",
+                [UNBOUND_LABEL] + list(modbus_label_to_id.keys()),
+                help="選填，之後也可以在上方表格內再綁定/修改。",
+            )
 
         btn_col1, btn_col2 = st.columns([1, 1])
         with btn_col1:
@@ -619,38 +710,60 @@ with tab_modbus:
                 if m_state_dict.strip():
                     formatted_state_dict = json.dumps(json.loads(m_state_dict))
 
-                with DatabaseConnector.get_connection() as conn:
-                    with conn.cursor() as cur:
-                        sql = """
-                        INSERT INTO modbus_scada (
-                            name, plc_ip, plc_port, slave_id, function_code, start_address, 
-                            data_type, byte_order, word_order, raw_min, raw_max, eng_min, eng_max, 
-                            state_dictionary,unit, plc_state
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OFFLINE');
-                        """
-                        cur.execute(
-                            sql,
-                            (
-                                m_name,
-                                m_plc_ip,
-                                int(m_plc_port),
-                                int(m_slave_id),
-                                m_unit,
-                                int(m_function_code),
-                                int(m_start_address),
-                                m_data_type,
-                                m_byte_order,
-                                m_word_order,
-                                m_raw_min if m_use_scale else None,
-                                m_raw_max if m_use_scale else None,
-                                m_eng_min if m_use_scale else None,
-                                m_eng_max if m_use_scale else None,
-                                formatted_state_dict,
-                            ),
-                        )
-                        conn.commit()
-                st.success(f"🎉 成功新增 Modbus 點位: {m_name}")
-                st.rerun()
+                new_sensor_id = (
+                    modbus_label_to_id.get(m_sensor_label)
+                    if m_sensor_label != UNBOUND_LABEL
+                    else None
+                )
+                conflict = None
+                if new_sensor_id is not None:
+                    binding_map = _load_sensor_binding_map()
+                    conflict = _find_binding_conflict(
+                        binding_map, new_sensor_id, "modbus_scada", None
+                    )
+
+                if conflict:
+                    st.error(
+                        f"❌ 想綁定的感測器已被其他點位使用：{conflict}，"
+                        "未新增。同一個感測器不能同時綁定多個點位。"
+                    )
+                else:
+                    with DatabaseConnector.get_connection() as conn:
+                        with conn.cursor() as cur:
+                            # 🔧 修正：原本欄位順序跟參數順序沒對齊
+                            # （unit 塞錯位置導致 function_code 收到字串），這裡重新對齊，
+                            # 並新增 sensor_id 欄位供感測器綁定使用。
+                            sql = """
+                            INSERT INTO modbus_scada (
+                                name, plc_ip, plc_port, slave_id, function_code, start_address, 
+                                data_type, byte_order, word_order, raw_min, raw_max, eng_min, eng_max, 
+                                state_dictionary, unit, sensor_id, plc_state
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OFFLINE');
+                            """
+                            cur.execute(
+                                sql,
+                                (
+                                    m_name,
+                                    m_plc_ip,
+                                    int(m_plc_port),
+                                    int(m_slave_id),
+                                    int(m_function_code),
+                                    int(m_start_address),
+                                    m_data_type,
+                                    m_byte_order,
+                                    m_word_order,
+                                    m_raw_min if m_use_scale else None,
+                                    m_raw_max if m_use_scale else None,
+                                    m_eng_min if m_use_scale else None,
+                                    m_eng_max if m_use_scale else None,
+                                    formatted_state_dict,
+                                    m_unit,
+                                    new_sensor_id,
+                                ),
+                            )
+                            conn.commit()
+                    st.success(f"🎉 成功新增 Modbus 點位: {m_name}")
+                    st.rerun()
             except json.JSONDecodeError:
                 st.error("❌ 狀態字典格式錯誤！請填寫合法的 JSON 格式")
             except Exception as e:
@@ -669,11 +782,10 @@ with tab_tia:
                 with conn.cursor() as cur:
                     query = """
                     SELECT 
-                        t.id, t.name, t.plc_name, t.plc_ip, t.db_number, t."offset", t.data_type, 
-                        t.plc_state, t.current_data, t.last_update, s.sensor_code, s.nickname
-                    FROM tia_scada t
-                    LEFT JOIN sensors s ON t.sensor_id = s.sensor_id
-                    ORDER BY t.id ASC;
+                        id, name, plc_name, plc_ip, db_number, "offset", data_type, 
+                        sensor_id, plc_state, current_data, last_update 
+                    FROM tia_scada 
+                    ORDER BY id ASC;
                     """
                     cur.execute(query)
                     cols = [desc[0] for desc in cur.description]
@@ -684,44 +796,60 @@ with tab_tia:
             return pd.DataFrame()
 
     df_tia = load_tia_tags()
-    tia_label_to_id, tia_id_to_label, tia_sensor_options = load_sensor_options()
+    tia_label_to_id, tia_id_to_label = _load_sensor_options()
 
     st.subheader("📋 TIA 點位列表（可直接於表格內修改參數）")
-    st.caption(
-        "「sensor_label」欄位是要把這個點位綁定到 sensors 階層的哪一個感測器，"
-        "顯示格式為「感測器編號（暱稱）」，選「（未綁定）」代表不寫入 sensor_readings 時序表。"
-    )
     if not df_tia.empty:
-        df_tia["sensor_label"] = df_tia.apply(
-            lambda r: _sensor_label(r["sensor_code"], r["nickname"]), axis=1
+        df_tia["sensor_label"] = df_tia["sensor_id"].apply(
+            lambda sid: tia_id_to_label.get(int(sid), UNBOUND_LABEL)
+            if pd.notnull(sid)
+            else UNBOUND_LABEL
         )
-        df_tia = df_tia.drop(columns=["sensor_code", "nickname"])
+        df_tia_display = df_tia.drop(columns=["sensor_id"])
 
         disabled_cols_tia = ["id", "plc_state", "current_data", "last_update"]
 
         edited_tia_df = st.data_editor(
-            df_tia,
+            df_tia_display,
             num_rows="dynamic",
             key="tia_editor",
             disabled=disabled_cols_tia,
             width="stretch",
             column_config={
                 "sensor_label": st.column_config.SelectboxColumn(
-                    "sensor_label（綁定感測器）",
-                    options=tia_sensor_options,
-                    required=True,
+                    "綁定感測器 (sensor_code)",
+                    options=[UNBOUND_LABEL] + list(tia_label_to_id.keys()),
+                    help="選擇這個點位對應的感測器，數值會同步寫入 sensor_readings 時序表。"
+                    "選單內容請先在「感測器階層管理」分頁建立。",
                 )
             },
         )
 
         if st.button("💾 儲存 TIA 修改", type="primary"):
+            binding_map = _load_sensor_binding_map()
             try:
                 with DatabaseConnector.get_connection() as conn:
                     with conn.cursor() as cur:
                         for index, row in edited_tia_df.iterrows():
                             if pd.notnull(row["id"]):
-                                selected_label = row.get("sensor_label")
-                                sensor_id_val = tia_label_to_id.get(selected_label)
+                                point_id = int(row["id"])
+
+                                sensor_label = row.get("sensor_label", UNBOUND_LABEL)
+                                sensor_id = (
+                                    tia_label_to_id.get(sensor_label)
+                                    if sensor_label != UNBOUND_LABEL
+                                    else None
+                                )
+                                conflict = _find_binding_conflict(
+                                    binding_map, sensor_id, "tia_scada", point_id
+                                )
+                                if conflict:
+                                    st.error(
+                                        f"❌ id={point_id}（{row['name']}）想綁定的感測器"
+                                        f"已被其他點位使用：{conflict}，該筆未儲存。"
+                                        "同一個感測器不能同時綁定多個點位。"
+                                    )
+                                    continue
 
                                 sql = """
                                 UPDATE tia_scada SET 
@@ -738,8 +866,8 @@ with tab_tia:
                                         int(row["db_number"]),
                                         int(row["offset"]),
                                         row["data_type"],
-                                        sensor_id_val,
-                                        int(row["id"]),
+                                        sensor_id,
+                                        point_id,
                                     ),
                                 )
                         conn.commit()
@@ -769,6 +897,11 @@ with tab_tia:
                 ["BOOL", "INT", "DINT", "REAL", "WORD", "DWORD"],
                 index=3,
             )
+            t_sensor_label = st.selectbox(
+                "綁定感測器 (sensor_code，可留空)",
+                [UNBOUND_LABEL] + list(tia_label_to_id.keys()),
+                help="選填，之後也可以在上方表格內再綁定/修改。",
+            )
 
         btn_col1, btn_col2 = st.columns([1, 1])
         with btn_col1:
@@ -792,26 +925,45 @@ with tab_tia:
 
         if submit_tia:
             try:
-                with DatabaseConnector.get_connection() as conn:
-                    with conn.cursor() as cur:
-                        sql = """
-                        INSERT INTO tia_scada (name, plc_name, plc_ip, db_number, "offset", data_type, plc_state)
-                        VALUES (%s, %s, %s, %s, %s, %s, 'OFFLINE');
-                        """
-                        cur.execute(
-                            sql,
-                            (
-                                t_name,
-                                t_plc_name,
-                                t_plc_ip,
-                                int(t_db_number),
-                                int(t_offset),
-                                t_data_type,
-                            ),
-                        )
-                        conn.commit()
-                st.success(f"🎉 成功新增 TIA 點位: {t_name}")
-                st.rerun()
+                new_sensor_id = (
+                    tia_label_to_id.get(t_sensor_label)
+                    if t_sensor_label != UNBOUND_LABEL
+                    else None
+                )
+                conflict = None
+                if new_sensor_id is not None:
+                    binding_map = _load_sensor_binding_map()
+                    conflict = _find_binding_conflict(
+                        binding_map, new_sensor_id, "tia_scada", None
+                    )
+
+                if conflict:
+                    st.error(
+                        f"❌ 想綁定的感測器已被其他點位使用：{conflict}，"
+                        "未新增。同一個感測器不能同時綁定多個點位。"
+                    )
+                else:
+                    with DatabaseConnector.get_connection() as conn:
+                        with conn.cursor() as cur:
+                            sql = """
+                            INSERT INTO tia_scada (name, plc_name, plc_ip, db_number, "offset", data_type, sensor_id, plc_state)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, 'OFFLINE');
+                            """
+                            cur.execute(
+                                sql,
+                                (
+                                    t_name,
+                                    t_plc_name,
+                                    t_plc_ip,
+                                    int(t_db_number),
+                                    int(t_offset),
+                                    t_data_type,
+                                    new_sensor_id,
+                                ),
+                            )
+                            conn.commit()
+                    st.success(f"🎉 成功新增 TIA 點位: {t_name}")
+                    st.rerun()
             except Exception as e:
                 st.error(f"❌ 新增失敗: {e}")
 
@@ -828,6 +980,12 @@ with tab_opcua:
             "並確認 `protocols/opcua_protocol.py` 已放入專案中。"
         )
         st.stop()
+
+    st.caption(
+        "💡 OPC UA 點位數值現在由主程式的常駐訂閱服務即時推播更新，"
+        "不需要等排程輪詢。若在下方新增/修改點位或重新瀏覽，"
+        "系統會自動通知訂閱服務在數秒內套用最新的點位表。"
+    )
 
     # ----------------------------------------------------------
     # 讀取 opcua_servers 清單
@@ -860,22 +1018,16 @@ with tab_opcua:
                 with conn.cursor() as cur:
                     if server_id:
                         query = """
-                        SELECT o.id, o.server_name, o.node_id, o.browse_name, o.display_name,
-                               o.data_type, o.current_data, o.quality, o.plc_state, o.last_update,
-                               s.sensor_code, s.nickname
-                        FROM opcua_tags o
-                        LEFT JOIN sensors s ON o.sensor_id = s.sensor_id
-                        WHERE o.server_id = %s ORDER BY o.id ASC;
+                        SELECT id, server_name, node_id, browse_name, display_name,
+                               data_type, sensor_id, current_data, quality, plc_state, last_update
+                        FROM opcua_tags WHERE server_id = %s ORDER BY id ASC;
                         """
                         cur.execute(query, (int(server_id),))
                     else:
                         query = """
-                        SELECT o.id, o.server_name, o.node_id, o.browse_name, o.display_name,
-                               o.data_type, o.current_data, o.quality, o.plc_state, o.last_update,
-                               s.sensor_code, s.nickname
-                        FROM opcua_tags o
-                        LEFT JOIN sensors s ON o.sensor_id = s.sensor_id
-                        ORDER BY o.id ASC;
+                        SELECT id, server_name, node_id, browse_name, display_name,
+                               data_type, sensor_id, current_data, quality, plc_state, last_update
+                        FROM opcua_tags ORDER BY id ASC;
                         """
                         cur.execute(query)
                     cols = [desc[0] for desc in cur.description]
@@ -932,7 +1084,11 @@ with tab_opcua:
                                     ),
                                 )
                         conn.commit()
-                st.success("✅ OPC UA Server 參數更新成功！")
+                st.success(
+                    "✅ OPC UA Server 參數更新成功！"
+                    "⚠️ 連線參數（IP/Port/帳密/安全性原則）的變更需重啟 main.py 才會套用；"
+                    "若只是想重新整理點位表，請改用下方「立即瀏覽並寫入資料庫」。"
+                )
                 st.rerun()
             except Exception as e:
                 st.error(f"❌ 儲存失敗: {e}")
@@ -1029,7 +1185,10 @@ with tab_opcua:
                             ),
                         )
                         conn.commit()
-                st.success(f"🎉 成功新增 OPC UA Server: {o_server_name}")
+                st.success(
+                    f"🎉 成功新增 OPC UA Server: {o_server_name}\n\n"
+                    "⚠️ 新的 Server 需要重新啟動 main.py 後，訂閱服務才會開始監控。"
+                )
                 st.rerun()
             except Exception as e:
                 st.error(f"❌ 新增失敗: {e}")
@@ -1040,9 +1199,10 @@ with tab_opcua:
     st.divider()
     st.subheader("🔍 手動瀏覽已儲存的 Server（立即執行，不用等排程週期）")
     st.caption(
-        "如果擔心 main.py 排程週期太長（點位多會拖慢整輪採集），"
-        "可以在這裡針對單一 Server 立即瀏覽並直接寫入資料庫，"
-        "不影響其他 Server 的排程。"
+        "針對單一 Server 立即重新瀏覽並寫入資料庫。"
+        "寫入完成後會自動通知常駐的訂閱服務重新整理訂閱內容"
+        "（新增的點位會開始被監控、移除的點位會停止監控），"
+        "通常數秒內即可生效，不需要重啟任何服務。"
     )
 
     if df_opcua_servers.empty:
@@ -1088,7 +1248,13 @@ with tab_opcua:
                             )
                             conn.commit()
 
-                    st.success(f"✅ 瀏覽完成，寫入 {len(tags)} 筆點位資料")
+                    # 🔥 通知常駐訂閱服務：點位表已更新，請重新整理訂閱內容
+                    request_opcua_resubscribe(int(selected_id))
+
+                    st.success(
+                        f"✅ 瀏覽完成，寫入 {len(tags)} 筆點位資料。"
+                        "已通知訂閱服務重新整理，數秒內會套用最新點位表。"
+                    )
                     st.rerun()
                 except Exception as e:
                     try:
@@ -1129,16 +1295,16 @@ with tab_opcua:
         df_opcua_tags = load_opcua_tags()
 
     if not df_opcua_tags.empty:
-        opcua_label_to_id, opcua_id_to_label, opcua_sensor_options = load_sensor_options()
-        df_opcua_tags["sensor_label"] = df_opcua_tags.apply(
-            lambda r: _sensor_label(r["sensor_code"], r["nickname"]), axis=1
-        )
-        df_opcua_tags = df_opcua_tags.drop(columns=["sensor_code", "nickname"])
+        opcua_label_to_id, opcua_id_to_label = _load_sensor_options()
 
-        st.caption(
-            "「sensor_label」欄位是要把這個點位綁定到 sensors 階層的哪一個感測器，"
-            "顯示格式為「感測器編號（暱稱）」，選「（未綁定）」代表不寫入 sensor_readings 時序表。"
+        df_opcua_tags["sensor_label"] = df_opcua_tags["sensor_id"].apply(
+            lambda sid: opcua_id_to_label.get(int(sid), UNBOUND_LABEL)
+            if pd.notnull(sid)
+            else UNBOUND_LABEL
         )
+        df_opcua_tags_display = df_opcua_tags.drop(columns=["sensor_id"])
+
+        st.caption("💡 可直接在下方表格的「綁定感測器」欄位選擇對應感測器後按儲存。")
 
         disabled_cols_opcua_tags = [
             "id", "server_name", "node_id", "browse_name", "display_name",
@@ -1146,33 +1312,51 @@ with tab_opcua:
         ]
 
         edited_opcua_tags_df = st.data_editor(
-            df_opcua_tags,
-            num_rows="fixed",
+            df_opcua_tags_display,
             key="opcua_tags_editor",
             disabled=disabled_cols_opcua_tags,
             width="stretch",
             column_config={
                 "sensor_label": st.column_config.SelectboxColumn(
-                    "sensor_label（綁定感測器）",
-                    options=opcua_sensor_options,
-                    required=True,
+                    "綁定感測器 (sensor_code)",
+                    options=[UNBOUND_LABEL] + list(opcua_label_to_id.keys()),
+                    help="選擇這個點位對應的感測器，數值會同步寫入 sensor_readings 時序表。"
+                    "選單內容請先在「感測器階層管理」分頁建立。",
                 )
             },
         )
 
-        if st.button("💾 儲存 OPC UA 點位的感測器綁定", type="primary"):
+        if st.button("💾 儲存 OPC UA 點位綁定", type="primary"):
+            binding_map = _load_sensor_binding_map()
             try:
                 with DatabaseConnector.get_connection() as conn:
                     with conn.cursor() as cur:
                         for index, row in edited_opcua_tags_df.iterrows():
-                            selected_label = row.get("sensor_label")
-                            sensor_id_val = opcua_label_to_id.get(selected_label)
+                            point_id = int(row["id"])
+
+                            sensor_label = row.get("sensor_label", UNBOUND_LABEL)
+                            sensor_id = (
+                                opcua_label_to_id.get(sensor_label)
+                                if sensor_label != UNBOUND_LABEL
+                                else None
+                            )
+                            conflict = _find_binding_conflict(
+                                binding_map, sensor_id, "opcua_tags", point_id
+                            )
+                            if conflict:
+                                st.error(
+                                    f"❌ id={point_id}（{row['node_id']}）想綁定的感測器"
+                                    f"已被其他點位使用：{conflict}，該筆未儲存。"
+                                    "同一個感測器不能同時綁定多個點位。"
+                                )
+                                continue
+
                             cur.execute(
-                                "UPDATE opcua_tags SET sensor_id=%s WHERE id=%s;",
-                                (sensor_id_val, int(row["id"])),
+                                "UPDATE opcua_tags SET sensor_id = %s WHERE id = %s;",
+                                (sensor_id, point_id),
                             )
                         conn.commit()
-                st.success("✅ OPC UA 點位感測器綁定更新成功！")
+                st.success("✅ OPC UA 點位綁定更新成功！")
                 st.rerun()
             except Exception as e:
                 st.error(f"❌ 儲存失敗: {e}")
@@ -1180,6 +1364,7 @@ with tab_opcua:
         st.info("目前尚無任何 OPC UA 點位資料，請先新增 Server 並執行瀏覽。")
 
 
+#######複製貼上的##############################
 # ==========================================
 # Tab 4: 感測器階層管理 (sites -> production_lines -> devices -> sensors)
 # ==========================================
@@ -1191,21 +1376,6 @@ with tab_hierarchy:
         "把每個點位的 sensor_code 欄位選成對應的感測器，"
         "採集程式就會自動把數值寫進 sensor_readings 時序表。"
     )
-
-    # ------------------------------------------------------------
-    # 通用查詢 helper
-    # ------------------------------------------------------------
-    def _fetch_df(query):
-        try:
-            with DatabaseConnector.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(query)
-                    cols = [desc[0] for desc in cur.description]
-                    rows = cur.fetchall()
-                    return pd.DataFrame(rows, columns=cols)
-        except Exception as e:
-            st.error(f"查詢失敗: {e}")
-            return pd.DataFrame()
 
     # ------------------------------------------------------------
     # 1. 廠區 (sites)

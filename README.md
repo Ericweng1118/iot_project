@@ -1,12 +1,8 @@
 # 多功能工業 PLC 資料採集系統 (Unified Industrial Data Collector)
 
-一個支援 **西門子 S7**、**Modbus TCP**、**OPC UA** 三協議的統一工業資料採集系統，具備：
-
-- PostgreSQL 批量更新（即時值 / 連線狀態）
-- **TimescaleDB 時序資料庫**（廠區 → 產線 → 設備 → 感測器 → 時序數據 的階層式儲存，含去重 / 心跳寫入規則）
-- 狀態字典翻譯（數字代碼 ↔ 文字狀態，不犧牲時序表的查詢效能）
-- MQTT 增量上傳（三協議皆支援，可透過環境變數一鍵開關）
-- Streamlit 網頁後台（點位參數管理、感測器階層管理、異常監控）
+一個支援 **西門子 S7**、**Modbus TCP**、**OPC UA** 三協議的統一工業資料採集系統，
+具備併發採集、OPC UA 訂閱推播、PostgreSQL/TimescaleDB 時序儲存、
+感測器階層管理、異常監控與 MQTT 增量上傳功能。
 
 ---
 
@@ -14,74 +10,91 @@
 
 ### 1. 多協議支援
 
-- **S7 Protocol (Siemens)** - 透過 `snap7` 庫連線 S7-1200/1500 PLC，讀取 DB 區塊數據
-- **Modbus TCP** - 透過 `pymodbus` 庫支援 FC1/2/3/4/5/6/15/16 功能碼，處理多位元組資料型態
-- **OPC UA** - 透過 `asyncua` 庫連線 OPC UA 伺服器，遞迴瀏覽 Address Space 並讀值
+- **S7 Protocol (Siemens)** — 透過 `snap7` 連線 S7-1200/1500 PLC，DB 區塊打包讀取
+- **Modbus TCP** — 透過 `pymodbus` 支援 FC1/2/3/4/5/6/15/16，處理多位元組資料型態與 Byte/Word Order
+- **OPC UA** — 透過 `asyncua`，**採用訂閱推播（Subscription）而非輪詢瀏覽**，詳見下方「OPC UA 訂閱服務」
 
-### 2. 雙層資料儲存架構
+### 2. 併發採集架構
 
-系統把資料分成「**即時層**」與「**時序層**」兩種用途：
+- Modbus、TIA(S7) 兩協議在每一輪採集中**併發執行**（`ThreadPoolExecutor`），
+  其中一個協議整體卡住（例如全部設備斷線在等 connect timeout）不會拖到另一個協議完全沒開始
+- 同一協議內，多台 PLC/設備也是併發連線（例如 Modbus 依 IP/Port/Slave 分組、TIA 依 PLC IP 分組），
+  一台離線只影響自己那條執行緒，不會拖慢其他台
+- PostgreSQL 連線池使用 `ThreadedConnectionPool`（執行緒安全），支援上述多執行緒併發存取
 
-| 層級 | 資料表 | 用途 |
-|---|---|---|
-| 即時層 | `tia_scada` / `modbus_scada` / `opcua_tags` | PLC 連線參數、當下最新值、連線狀態（ONLINE/OFFLINE/ERROR），給網頁後台與 MQTT 上傳用 |
-| 時序層 | `sites → production_lines → devices → sensors → sensor_readings` | 廠區/產線/設備/感測器階層 + 長期歷史時序資料（TimescaleDB hypertable） |
+### 3. OPC UA 訂閱服務（Report by Exception）
 
-每個點位可以透過 `sensor_id` 欄位對應到 `sensors` 階層底下的某一個感測器；對應好之後，採集程式會依「數值不同才寫入、否則每隔一段時間心跳寫入」的規則，自動把數值寫進 `sensor_readings`。沒有綁定 `sensor_id` 的點位，即時層功能完全不受影響，只是不會產生歷史時序資料。
+OPC UA 不再像 Modbus/TIA 一樣每輪重新輪詢，而是常駐一個獨立的背景服務：
 
-### 3. 狀態字典翻譯（數字 ↔ 文字）
+- 只在**必要時**才做結構性瀏覽（browse）：第一次啟動、或使用者於網頁手動觸發重新整理
+- 平常靠 Server 端的 **Subscription 推播**：有變化 Server 才通知，本服務收到後先寫進記憶體緩衝區，
+  每 2 秒批次寫回資料庫，大幅減少「每輪重新爬整棵 Address Space」的開銷
+- 定期心跳（讀取 ServerStatus 節點）偵測斷線，斷線後自動指數退避重連（5s → 10s → … 上限 60s），
+  重連後直接用快取的點位表重建訂閱，**不需要**重新瀏覽
+- 詳細操作方式見下方「OPC UA 點位設定」分頁說明
 
-`sensor_readings.value` 固定是 `NUMERIC`，只存數字，這是刻意設計（時序表要拿來做壓縮、`AVG`/`MIN`/`MAX`/`time_bucket` 等聚合運算，混進文字會讓這些功能失效）。但很多點位（尤其 Modbus 的運轉狀態）數值代表的其實是一個狀態（例如 `1` = 待機、`2` = 運轉）。
+### 4. 感測器階層管理與時序資料
 
-解法是把「翻譯」這件事放在**查詢層**，而不是儲存層：`sensors` 表有一個 `state_dictionary`（JSONB）欄位，設定好之後查詢 `sensor_readings_translated` 這個 view，就會自動把數字代碼翻譯成文字，`sensor_readings` 本身完全不受影響。
+- 雙層資料架構：**即時層**（`modbus_scada` / `tia_scada` / `opcua_tags`，存目前值與連線狀態）
+  與 **時序層**（`sensor_readings` hypertable，存歷史數值），透過 `sensor_id` 連結
+- 階層架構：廠區 (`sites`) → 產線 (`production_lines`) → 設備 (`devices`) → 感測器 (`sensors`) → 讀值 (`sensor_readings`)
+- 感測器可設定 `nickname`（顯示用暱稱）與 `state_dictionary`（數字轉文字狀態字典），
+  搭配 `sensor_readings_translated` view 自動把數字翻譯成中文狀態
+- 網頁「感測器階層管理」分頁可直接維護這整條階層
+- Modbus / TIA / OPC UA 三個點位設定分頁都有「綁定感測器」下拉選單，並內建**跨協議重複綁定偵測**，
+  避免同一個感測器被兩個不同點位同時綁定
 
-### 4. 數據增量上傳 (Report by Exception)
+### 5. 異常監控
 
-系統會快取上一輪的值，只有當數值發生變化時才透過 MQTT 發送，節省頻寬與 Broker 負載。三個協議（Modbus / TIA / OPC UA）都會併入同一次上傳。**MQTT 上傳功能可以透過 `.env` 的 `MQTT_ENABLED` 開關整組停用**，不需要改動程式碼。
+網頁內建「異常監控」分頁，彙整三種常見異常，不用自己下 SQL 查：
 
-### 5. PostgreSQL 批量更新
+- 🔌 **連線異常**：三個即時層資料表中 `plc_state ≠ ONLINE` 的點位
+- 📈 **數值超出正常範圍**：依 `sensors.min_threshold` / `max_threshold` 比對最新一筆 `sensor_readings`
+- ⏱️ **資料斷更**：超過使用者設定的時數門檻沒有新資料的感測器（含「從未寫入過」的感測器）
 
-即時層使用 `execute_values` / `UPDATE FROM VALUES`，時序層使用 `execute_values` 批次 `INSERT ... ON CONFLICT DO NOTHING`，都是一次性批量寫入，減少資料庫連線開銷與 I/O 瓶頸。
+### 6. 數據增量上傳 (Report by Exception)
 
-### 6. Streamlit 網頁管理後台
+MQTT 端同樣採用增量發送：快取上一輪的值，只有數值變化時才發送，並定期強制全量心跳上傳，
+節省頻寬與 Broker 負載。
 
-- 點位參數管理（Modbus / TIA / OPC UA）：新增、編輯連線參數，即時測試連線，並可用下拉選單把點位綁定到感測器（顯示「感測器編號（暱稱）」，方便對照）
-- **感測器階層管理**：直接在網頁上建立廠區 → 產線 → 設備 → 感測器，可編輯 `nickname`（暱稱）、`state_dictionary`（狀態字典）等欄位
-- **異常監控**：彙整連線異常、數值超出正常範圍、資料斷更三種常見異常，不用手動下 SQL
+### 7. PostgreSQL 批量更新
+
+使用 `execute_values` 一次性更新多筆點位，減少資料庫連線開銷與 I/O 瓶頸；
+OPC UA 訂閱模式另外提供輕量版 `batch_update_opcua_values`，只更新數值不動結構欄位，
+讓高頻的數值 flush 盡量精簡。
 
 ---
 
 ## 📁 專案結構
 
 ```
-├── protocols/                     # 協議驅動層
-│   ├── s7_protocol.py             # 西門子 S7 協議實現（DB 數據讀取）
-│   ├── modbus_protocol.py         # Modbus TCP 協議實現（多位元組解析）
-│   └── opcua_protocol.py          # OPC UA 協議實現（資料讀取與瀏覽）
-├── parsers/                       # 數據解析器
-│   ├── plc_parser.py              # S7 數據解析（字節順序、線性縮放）
-│   └── encoder.py                 # Modbus 編碼/解碼（32/64 位元支援）
-├── data_layer/                    # 數據層
-│   ├── db_connector.py            # PostgreSQL 連線管理與查詢封裝
-│   ├── batch_updater.py           # 即時層批量更新邏輯（execute_values）
-│   └── timeseries_writer.py       # 時序層寫入模組（去重 / 心跳規則，批次寫入 sensor_readings）
-├── messaging/                     # 訊息通訊層
-│   └── mqtt_publisher.py          # MQTT 發送器（自動連線、失敗重試、增量上傳）
-├── collector/                     # 存放協議撈資料用的主程式
-│   ├── run_modbus_collector.py    # 撈 Modbus 資料用的主程式
-│   ├── run_s7_collector.py        # 撈 S7 / TIA 資料用的主程式
-│   └── run_opcua_collector.py     # 撈 OPC UA 資料用的主程式
-├── sql/                            # 資料庫遷移腳本（依編號順序執行）
-│   ├── 001_sensor_hierarchy_and_mapping.sql   # 建立時序層五張表 + 即時層加 sensor_id
-│   ├── 002_add_sensor_nickname.sql            # sensors 加 nickname 欄位
-│   ├── 003_fix_tia_scada_last_update_type.sql # 修正 tia_scada.last_update 型態
-│   └── 004_add_sensor_state_dictionary.sql    # sensors 加 state_dictionary + 翻譯 view
-├── main.py                        # 統一主程式（三協議整合 + MQTT + 時序寫入）
-├── requirements.txt                 # Python 依賴套件
-├── Dockerfile                       # Docker 容器化設定
-├── .env                              # 環境變數設定（請自行建立，勿提交 Git）
-├── admin_app.py                    # 網頁介面入口（點位設定 + 感測器階層管理 + 異常監控）
-└── run_all.py                      # 統一主程式（三協議整合 + 網頁一起開啟）
+├── protocols/                    # 協議驅動層
+│   ├── s7_protocol.py            # 西門子 S7 協議實現（DB 數據讀取）
+│   ├── modbus_protocol.py        # Modbus TCP 協議實現（多位元組解析）
+│   └── opcua_protocol.py         # OPC UA 協議實現（連線、遞迴瀏覽、資料讀取）
+├── parsers/                      # 數據解析器
+│   ├── plc_parser.py             # S7 數據解析（字節順序、線性縮放）
+│   └── encoder.py                # Modbus 編碼/解碼（32/64 位元支援）
+├── data_layer/                   # 數據層
+│   ├── db_connector.py           # PostgreSQL 連線池管理（ThreadedConnectionPool）
+│   └── batch_updater.py          # 批量更新邏輯（execute_values）
+├── messaging/                    # 訊息通訊層
+│   └── mqtt_publisher.py         # MQTT 發送器（自動連線、失敗重試、增量上傳）
+├── services/                     # 常駐背景服務
+│   └── opcua_subscription_service.py   # OPC UA 訂閱服務（獨立執行緒 + asyncio）
+├── collector/                    # 各協議的採集主程式
+│   ├── run_modbus_collector.py   # Modbus 資料採集（多設備併發）
+│   ├── run_s7_collector.py       # TIA/S7 資料採集（多 PLC 併發）
+│   └── run_opcua_collector.py    # OPC UA 一次性瀏覽採集（獨立測試用，main.py 已改用訂閱服務）
+├── migrations/                   # 資料庫 Migration Script（001 ~ 005，依序執行）
+│   └── 005_opcua_resubscribe_flag.sql
+├── main.py                       # 統一主程式（Modbus/TIA 併發輪詢 + OPC UA 常駐訂閱服務）
+├── admin_app.py                  # 網頁管理後台入口（Streamlit）
+├── run_all.py                    # 同時啟動 main.py 與 admin_app.py
+├── requirements.txt              # Python 依賴套件
+├── Dockerfile                    # Docker 容器化設定
+├── .env                          # 環境變數設定（請自行建立，勿提交 Git）
+└── README.md
 ```
 
 ---
@@ -96,70 +109,59 @@ source .venv/bin/activate  # Linux/Mac
 pip install -r requirements.txt
 ```
 
-### 2. 建立資料庫（TimescaleDB 需求）
-
-先確認 PostgreSQL 已安裝 TimescaleDB 擴充套件（14 以上 + TimescaleDB 2.x 以上），接著**依編號順序**執行 `sql/` 底下的遷移腳本：
-
-```bash
-psql -h <DB_HOST> -U <DB_USER> -d <DB_NAME> -f sql/001_sensor_hierarchy_and_mapping.sql
-psql -h <DB_HOST> -U <DB_USER> -d <DB_NAME> -f sql/002_add_sensor_nickname.sql
-psql -h <DB_HOST> -U <DB_USER> -d <DB_NAME> -f sql/003_fix_tia_scada_last_update_type.sql
-psql -h <DB_HOST> -U <DB_USER> -d <DB_NAME> -f sql/004_add_sensor_state_dictionary.sql
-```
-
-> ⚠️ **權限務必補齊，這是最常踩的坑**：新增的資料表 / 序列 (sequence) 都需要單獨授權，資料表權限跟序列權限是分開兩件事，圖形介面（如 pgAdmin）授權時容易漏掉序列。直接用 SQL 一次補齊最保險：
-> ```sql
-> GRANT SELECT, INSERT, UPDATE ON sites, production_lines, devices, sensors, sensor_readings TO your_db_user;
-> GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO your_db_user;
-> ALTER DEFAULT PRIVILEGES IN SCHEMA public
->     GRANT USAGE, SELECT ON SEQUENCES TO your_db_user;
-> ```
-
-### 3. 建立 `.env` 環境變數檔案
+### 2. 建立 `.env` 環境變數檔案
 
 ```bash
 # ===== 資料庫連線設定 =====
-DB_HOST=192.168.x.x          # PostgreSQL 伺服器 IP
-DB_PORT=5432                 # PostgreSQL 埠號
-DB_NAME=your_database        # 資料庫名稱
-DB_USER=your_username        # 資料庫使用者
-DB_PASSWORD=your_password    # 資料庫密碼
+DB_HOST=192.168.x.x
+DB_PORT=5432
+DB_NAME=your_database
+DB_USER=your_username
+DB_PASSWORD=your_password
 
 # ===== MQTT 伺服器設定 =====
-MQTT_ENABLED=true            # 是否啟用 MQTT 增量上傳；設為 false 可整組停用（不用改程式碼）
-MQTT_BROKER=192.168.x.x      # MQTT Broker IP
-MQTT_PORT=1883               # MQTT 埠號（預設 1883）
-MQTT_USER=your_mqtt_user     # MQTT 使用者（可選）
-MQTT_PASSWORD=your_password  # MQTT 密碼（可選）
-MQTT_GROUP_ID=scada_unified  # 設備/群組識別 ID
-MQTT_TOPIC=iot-2/evt/wadata/fmt/scada_unified  # MQTT 發布主題
+MQTT_BROKER=192.168.x.x
+MQTT_PORT=1883
+MQTT_USER=your_mqtt_user
+MQTT_PASSWORD=your_password
+MQTT_GROUP_ID=scada_unified
+MQTT_TOPIC=iot-2/evt/wadata/fmt/scada_unified
 
-# ==========================================
-# 採集服務週期設定
-# ==========================================
-POLL_INTERVAL="60.0"           # 採集週期 (秒)
-OPCUA_POLL_INTERVAL="60.0"     # OPC UA 查詢瀏覽週期
+# ===== 採集服務週期設定 =====
+# 僅套用於 Modbus / TIA(S7)；OPC UA 改由常駐訂閱服務即時處理，不受此週期影響
+POLL_INTERVAL="60.0"
 
-# ===== 時序層 (sensor_readings) 寫入規則設定 =====
-# 數值沒有變化時，最久多久仍要補寫一筆進 sensor_readings 當作心跳（秒），預設 3600 秒 = 1 小時
-SENSOR_HEARTBEAT_INTERVAL=3600
-
-# ===== 網頁小工具設定 =====
+# ===== 網頁小工具入口帳號、密碼、PORT =====
 ADMIN_USER=user
 ADMIN_PASSWORD=password
 ADMIN_PORT=PORT_NUMBER
 ```
 
+### 3. 執行資料庫 Migration
+
+依序執行 `migrations/` 內的 SQL（001 ~ 005）。**若是既有系統升級**，
+至少要補跑最新的：
+
+```sql
+-- 005_opcua_resubscribe_flag.sql
+ALTER TABLE opcua_servers
+    ADD COLUMN IF NOT EXISTS resubscribe_requested BOOLEAN NOT NULL DEFAULT FALSE;
+```
+
+> ⚠️ 若使用非 superuser 角色連線（例如 `scada`），記得確認該角色對相關資料表
+> 有 `SELECT / INSERT / UPDATE / DELETE` 權限；**PostgreSQL 的 GRANT 對表和序列
+> (sequence) 是分開的**，兩者都要 GRANT 才不會遇到權限錯誤。
+
 ### 4. 執行主程式
 
 ```bash
 source .venv/bin/activate
-python main.py
+python main.py          # 只跑採集主服務
+# 或
+python run_all.py       # 同時跑採集主服務 + 網頁管理後台
 ```
 
-也可以用 `python run_all.py` 同時啟動採集主程式與 Streamlit 網頁後台。
-
-### 方法二：Docker 容器化執行
+### 5. Docker 容器化執行
 
 ```bash
 docker build -t unified_collector:latest .
@@ -168,121 +170,200 @@ docker run -d --name unified_collector --env-file .env unified_collector:latest
 
 ---
 
-## 📊 資料庫架構總覽
+## 🧠 執行架構說明
+
+### 主迴圈（`main.py`）
 
 ```
-【即時層】                          【時序層】
-tia_scada       ─┐                sites（廠區）
-modbus_scada     ├─ sensor_id ──▶     └── production_lines（產線）
-opcua_tags      ─┘                          └── devices（設備）
-                                                   └── sensors（感測器，含 nickname / state_dictionary）
-                                                          └── sensor_readings（純數字時序資料，hypertable）
-                                                                 └── sensor_readings_translated（view，自動翻譯文字狀態）
+每輪 POLL_INTERVAL 秒：
+  ├─ Modbus 採集  ─┐
+  └─ TIA(S7) 採集 ─┴─ 併發執行 (ThreadPoolExecutor)，互不阻塞
+  └─ MQTT 增量上傳（等上面兩個都跑完才執行，確保撈到本輪最新資料）
+
+（OPC UA 完全不在這個迴圈裡，見下方）
 ```
 
-- 即時層三張表維持你原本的欄位與用途（PLC 連線參數、當下最新值、連線狀態），採集程式邏輯完全不變
-- 每張即時層表新增一個 `sensor_id INTEGER REFERENCES sensors(sensor_id)` 欄位，作為串接時序層的橋樑
-- `sensor_readings` 是唯一會快速成長的表，已轉換為 TimescaleDB hypertable 依時間自動分區
-- 重複數值的過濾在**寫入端**（`data_layer/timeseries_writer.py`）處理，資料庫本身不做重複值過濾
+### OPC UA 訂閱服務（`services/opcua_subscription_service.py`）
 
-### 即時層：TIA_SCADA 表格（西門子 PLC 點位）
+`main.py` 啟動時會另外開一個**獨立的背景執行緒**（有自己的 asyncio event loop），
+跟上面的主迴圈完全脫鉤、互不阻塞：
 
-| 欄位名稱 | 型態 | 說明 |
+```
+服務啟動
+  └─ 對每一台 enabled=TRUE 的 Server：
+        ├─ 連線
+        ├─ 有快取點位表就直接用；沒有才做一次完整 browse 並寫入 opcua_tags
+        ├─ 建立 Subscription，監控所有已知點位
+        ├─ 背景 task 1：每 2 秒把收到的變化批次 flush 進資料庫
+        ├─ 背景 task 2：每 5 秒檢查一次「是否有人請求重新整理點位表」
+        └─ 每 15 秒讀一次 ServerStatus 節點當心跳；讀取失敗 → 判定斷線 → 退避重連
+```
+
+**新增點位 / 移除點位的流程：**
+使用者在網頁「OPC UA 點位設定」分頁按下「🚀 立即瀏覽並寫入資料庫」後：
+
+1. 立即重新瀏覽該 Server 並把最新點位表寫入 `opcua_tags`
+2. 順便把 `opcua_servers.resubscribe_requested` 設為 `TRUE`
+3. 訂閱服務下一次輪詢（最多等 5 秒）偵測到旗標，重新瀏覽、比對差異、
+   把新增的點位加入訂閱、把移除的點位取消訂閱，然後自動把旗標清回 `FALSE`
+
+整個過程**不需要重啟任何服務**。
+
+**已知限制：**
+
+- 新增一台**全新**的 OPC UA Server，或修改 Server 的連線參數（IP/Port/帳密/安全性原則）、
+  或切換 `enabled` 開關，訂閱服務目前不會動態偵測，需要**重新啟動 `main.py`** 才會套用
+- 點位從 Server 端移除後，`opcua_tags` 裡的舊資料列不會自動刪除，只會停止更新數值
+
+---
+
+## 🖥️ 網頁管理後台操作說明（`admin_app.py`）
+
+登入後有 5 個分頁：
+
+### 分頁 1：📡 Modbus 點位設定
+
+- 表格內可直接編輯任何欄位後按「💾 儲存 Modbus 修改」
+- `state_dictionary` 欄位若要設定數字轉文字映射，填合法 JSON，例如 `{"1": "待機", "2": "運轉"}`
+  （系統會自動正規化格式，就算表格編輯器把它顯示成單引號的 Python 字典字面量也能正確解析）
+- **綁定感測器**：表格與「單筆新增」表單都有「綁定感測器 (sensor_code)」下拉選單，
+  選項格式為「設備編號 / 感測器編號 (暱稱)」，選好後存檔即可，不用自己記 `sensor_id` 數字；
+  下拉選單內容來自「感測器階層管理」分頁已建立的感測器
+- 下方表單可單筆新增點位，並提供「🧪 測試連線與讀取」按鈕在寫入資料庫前先驗證參數是否正確
+
+### 分頁 2：📡 TIA (S7) 點位設定
+
+- 操作方式同 Modbus 分頁，包含「綁定感測器」下拉選單
+- 新增/編輯點位前建議先用「🧪 測試連線與讀取」驗證 DB 區塊位址、資料型態是否正確
+- 提醒：PLC 端需開啟 PUT/GET 存取權限，且該 DB 需**關閉**「優化區塊存取」，否則讀取會失敗
+
+### 分頁 3：📡 OPC UA 點位設定
+
+- **Server 清單**：可編輯連線參數，但**變更連線參數需要重啟 main.py 才會套用**
+- **新增 Server**：填完連線資訊可先「🧪 測試連線與瀏覽」預覽會抓到哪些點位，確認無誤再「新增 Server」；
+  新 Server 一樣需要重啟 main.py，訂閱服務才會開始監控
+- **手動瀏覽**：針對已存在的 Server，「🚀 立即瀏覽並寫入資料庫」可以立即重新整理點位表，
+  完成後會自動通知訂閱服務更新監控內容，通常幾秒內生效
+- **已採集的點位資料**：可依 Server 篩選檢視目前所有點位的即時數值，並有「綁定感測器」欄位可編輯，
+  改完按「💾 儲存 OPC UA 點位綁定」（其餘欄位如 node_id、數值等唯讀，只能透過瀏覽更新）
+
+### 🔗 感測器綁定與跨協議重複偵測
+
+Modbus / TIA / OPC UA 三個分頁的「綁定感測器」欄位共用同一套邏輯：
+
+- 選單只列出已經在「感測器階層管理」分頁建立好的感測器，格式為「設備編號 / 感測器編號 (暱稱)」
+- **同一個感測器不能同時被兩個不同點位綁定**：存檔時系統會檢查該感測器是否已被
+  Modbus/TIA/OPC UA 任一其他點位使用，若衝突會擋下該筆並標明是哪個點位衝突（例如
+  `modbus_scada.12（溫度感測器_01）`），該筆不會被儲存，其餘沒有衝突的筆數仍會正常存檔
+- 綁定後，採集程式會自動把該點位的數值同時寫入 `sensor_readings` 時序表（透過 `sensor_id` 連結）
+
+### 分頁 4：🧬 感測器階層管理
+
+依序建立廠區 → 產線 → 設備 → 感測器：
+
+1. **🏭 廠區 (sites)**：填廠區名稱、位置
+2. **🏗️ 產線 (production_lines)**：選擇所屬廠區，填產線名稱
+3. **⚙️ 設備 (devices)**：選擇所屬產線，填設備編號（唯一）、名稱、類型、製造商、狀態
+4. **🌡️ 感測器 (sensors)**：選擇所屬設備，填感測器編號（唯一）、選填暱稱、類型、單位、
+   正常值上下限、選填狀態字典
+
+建立好感測器後，回到 Modbus / TIA / OPC UA 點位設定分頁，把對應點位的「綁定感測器」
+欄位選成這個感測器，採集程式就會自動把數值同時寫入 `sensor_readings` 時序表。
+
+> 💡 感測器一旦建立，`sensor_code` 和所屬設備不能再改（避免破壞既有歷史資料的關聯），
+> 但 `nickname`、類型、單位、閾值、狀態字典都可以隨時在表格內編輯調整。
+
+### 分頁 5：🚨 異常監控
+
+- **連線異常**：列出所有 `plc_state` 不是 `ONLINE` 的點位，橫跨 Modbus / TIA / OPC UA 三種來源
+- **數值超出正常範圍**：列出已綁定感測器中，最新讀值超出 `min_threshold` / `max_threshold` 的項目
+- **資料斷更**：可自訂「太久沒更新」的時數門檻，列出超過門檻沒有新資料的感測器，
+  另外也會列出「從建立以來從未寫入過任何讀值」的感測器（通常代表尚未綁定點位，或該點位一直讀取失敗）
+
+---
+
+## 📊 資料庫表格設計
+
+### 即時層
+
+#### `modbus_scada`（Modbus TCP 點位）
+
+| 欄位 | 型態 | 說明 |
 | --- | --- | --- |
-| `id` | SERIAL | 主鍵，自動遞增 |
-| `name` | VARCHAR/TEXT | 點位名稱（用作 MQTT Key 與變動比對基準） |
-| `plc_ip` | VARCHAR | PLC IP 地址 |
-| `db_number` | INTEGER | S7 DB 區塊號碼 |
-| `offset` | INTEGER | 記憶體偏移量 |
-| `data_type` | VARCHAR | 資料型態（DINT, REAL, BOOL, INT 等） |
-| `plc_name` | VARCHAR | PLC 設備名稱 |
-| `current_data` | JSONB | 採集數據（格式：`{"val": 123.45}`） |
-| `plc_state` | VARCHAR | 連線狀態（ONLINE/OFFLINE/ERROR） |
-| `last_update` | **TIMESTAMPTZ** | 最後成功更新時間（原本誤設為 `TIME WITH TIME ZONE`，已由 `003` 遷移腳本修正） |
-| `sensor_id` | INTEGER | 對應 `sensors.sensor_id`，NULL 代表尚未綁定，不會寫入 `sensor_readings` |
-
-### 即時層：modbus_scada 表格（Modbus TCP 點位）
-
-| 欄位名稱 | 型態 | 說明 |
-| --- | --- | --- |
-| `id` | SERIAL | 主鍵，自動遞增 |
-| `name` | VARCHAR/TEXT | 點位名稱 |
-| `plc_ip` / `plc_port` | VARCHAR / INTEGER | 連線位址（port 預設 502） |
-| `slave_id` | INTEGER | Modbus 從站 ID (1-247) |
-| `function_code` | INTEGER | 功能碼 (1=Coils, 2=Discrete Inputs, 3=Holding Registers, 4=Input Registers) |
-| `start_address` | INTEGER | 起始暫存器/位址 |
-| `data_type` | VARCHAR | 資料型態（bool, word, int, dint, float, uint32, int64, float64, uint64） |
-| `raw_min` / `raw_max` | REAL | 原始值上下限 |
-| `eng_min` / `eng_max` | REAL | 工程值上下限 |
-| `byte_order` / `word_order` | VARCHAR | 位元組 / 字組順序（BIG/LITTLE） |
-| `state_dictionary` | JSONB | 狀態字典（例如：`{"1": "待機", "2": "運轉"}`），僅套用在 `current_data` 顯示用 |
-| `current_value` | REAL | 當前數值（純數值格式） |
-| `current_data` | JSONB | 採集數據（格式：`{"val": ...}`，可能是數字或狀態字典轉出的文字） |
-| `plc_state` | VARCHAR | 連線狀態（ONLINE/OFFLINE/ERROR） |
+| `id` | SERIAL | 主鍵 |
+| `name` | TEXT | 點位名稱（MQTT Key 與增量比對基準） |
+| `plc_ip` / `plc_port` / `slave_id` | — | 連線資訊 |
+| `function_code` | INTEGER | 1/2/3/4 |
+| `start_address` | INTEGER | 起始位址 |
+| `data_type` | VARCHAR | bool/word/int/dint/float/uint32/int64/float64/uint64 |
+| `raw_min` / `raw_max` / `eng_min` / `eng_max` | REAL | 線性 Scaling 參數 |
+| `byte_order` / `word_order` | VARCHAR | BIG / LITTLE |
+| `state_dictionary` | JSONB | 數字轉文字映射，例如 `{"1": "待機"}` |
+| `sensor_id` | INTEGER | FK → `sensors(sensor_id)`，可為 NULL；綁定後數值會同步寫入 `sensor_readings` |
+| `current_value` | REAL | 目前數值（純數字） |
+| `current_data` | JSONB | 採集數據，格式 `{"val": 123.45}` |
+| `plc_state` | VARCHAR | ONLINE / OFFLINE / ERROR |
 | `last_update` | TIMESTAMPTZ | 最後成功更新時間 |
-| `sensor_id` | INTEGER | 對應 `sensors.sensor_id` |
 
-> ⚠️ 寫進 `sensor_readings` 的一律是**轉換前的原始數字代碼**（例如 `1`、`2`），不是狀態字典轉出的中文文字，這樣才能維持時序表的聚合效能。要看文字，查 `sensor_readings_translated`。
+#### `tia_scada`（西門子 PLC 點位）
 
-### 即時層：opcua_servers / opcua_tags
-
-- `opcua_servers`：Server 連線參數（ip/port/帳密/安全性原則/瀏覽起始節點/瀏覽深度/連線狀態）
-- `opcua_tags`：週期性瀏覽出來的點位與最新數值，多一個 `sensor_id` 欄位；upsert 時**刻意不覆蓋** `sensor_id`，保護手動綁定的對應關係
-
-### 時序層：sites / production_lines / devices / sensors / sensor_readings
-
-| 資料表 | 主要欄位 | 說明 |
+| 欄位 | 型態 | 說明 |
 | --- | --- | --- |
-| `sites` | `site_id`, `site_name`, `location` | 廠區（階層最上層） |
-| `production_lines` | `line_id`, `site_id`, `line_name` | 產線，屬於某個廠區 |
-| `devices` | `device_id`, `line_id`, `device_code`(唯一), `device_name`, `device_type`, `manufacturer`, `install_date`, `status` | 設備，屬於某條產線 |
-| `sensors` | `sensor_id`, `device_id`, `sensor_code`(唯一), `nickname`, `sensor_type`, `unit`, `min_threshold`, `max_threshold`, `state_dictionary` | 感測器，屬於某台設備。`nickname` 方便對照識別；`state_dictionary`（JSONB，選填）用於數字↔文字翻譯 |
-| `sensor_readings` | `reading_id`, `sensor_id`, `reading_time`, `value` | 時序數據，**TimescaleDB hypertable**，主鍵為 `(sensor_id, reading_time)`，`value` 固定 `NUMERIC` |
-| `sensor_readings_translated` | (view) | 在 `sensor_readings` 之上自動套用 `sensors.state_dictionary` 翻譯成文字，原始表不受影響 |
+| `id` | SERIAL | 主鍵 |
+| `name` / `plc_name` / `plc_ip` | — | 識別與連線資訊 |
+| `db_number` / `offset` | INTEGER | S7 DB 區塊與偏移量 |
+| `data_type` | VARCHAR | DINT/REAL/BOOL/INT/WORD/DWORD 等 |
+| `sensor_id` | INTEGER | FK → `sensors(sensor_id)`，可為 NULL；綁定後數值會同步寫入 `sensor_readings` |
+| `current_data` | JSONB | 格式 `{"val": 123.45}` |
+| `plc_state` | VARCHAR | ONLINE / OFFLINE / ERROR |
+| `last_update` | TIMESTAMPTZ | 最後成功更新時間 |
 
----
+#### `opcua_servers`（已知 OPC UA Server 連線資訊）
 
-## 📝 資料寫入規則（時序層）
-
-由 `data_layer/timeseries_writer.py` 的 `SensorReadingWriter` 負責，規則如下：
-
-1. 該 `sensor_id` 第一次出現 → 寫入
-2. 新值與快取中「上一筆已寫入的值」不同 → 寫入
-3. 數值相同，但距離上次寫入已超過 `SENSOR_HEARTBEAT_INTERVAL`（預設 1 小時）→ 仍寫入（心跳，證明感測器仍在正常回報）
-4. 其餘情況（數值相同 且 未到心跳時間）→ 不寫入，跳過
-
-判斷全部在記憶體快取中完成，不會每輪都查一次資料庫；服務啟動時會呼叫 `load_initial_cache()`，把每個 `sensor_id` 在資料庫裡目前最新的一筆讀回來初始化快取，避免程式重啟後心跳判斷從頭算。
-
-實際寫入時機（依採集程式而定）：
-
-| 協議 | 暫存 (`stage`) 時機 | 批次寫入 (`flush`) 時機 |
+| 欄位 | 型態 | 說明 |
 | --- | --- | --- |
-| S7 | 每個點位解析成功後 | 該輪 S7 採集結束時 |
-| Modbus | 每個點位讀取成功且非狀態字典文字時 | 該輪 Modbus 採集結束時 |
-| OPC UA | 每個 Server upsert 完 `opcua_tags` 後，依查回的 `sensor_id` 暫存 | 全部 Server 掃描完成後 |
+| `id` | SERIAL | 主鍵 |
+| `server_name` | VARCHAR(100) | 唯一，用於 MQTT Key |
+| `ip` / `port` | — | 連線資訊 |
+| `username` / `password` | — | 可為 NULL（匿名連線） |
+| `security_policy` / `security_mode` | VARCHAR(30) | 預設 None |
+| `root_node_id` | VARCHAR(100) | 瀏覽起始節點，預設 `i=85` |
+| `browse_depth` | INTEGER | 遞迴瀏覽深度上限 |
+| `enabled` | BOOLEAN | 是否啟用此 Server |
+| `resubscribe_requested` | BOOLEAN | 🆕 訂閱服務用：是否有「重新整理點位表」請求待處理 |
+| `conn_state` | VARCHAR(20) | ONLINE / OFFLINE / ERROR |
+| `last_scan` / `last_error` | — | 最後瀏覽時間 / 最後錯誤訊息 |
 
-> 💡 三個 collector 內都有 `sensor_reading_writer` 這個共用單例，`flush()` 呼叫一定要存在，缺了這行資料會停在記憶體緩衝區、永遠寫不進資料庫，而且不容易察覺（詳見下方疑難排解表）。
+#### `opcua_tags`（瀏覽出來的點位與最新數值）
 
----
+| 欄位 | 型態 | 說明 |
+| --- | --- | --- |
+| `id` | SERIAL | 主鍵 |
+| `server_id` | INTEGER | FK → `opcua_servers(id)` |
+| `server_name` | VARCHAR(100) | 冗餘存一份，方便 MQTT Key 組合 |
+| `node_id` | VARCHAR(200) | OPC UA NodeId，例如 `ns=2;s=Temp01` |
+| `browse_name` / `display_name` | VARCHAR(200) | — |
+| `data_type` | VARCHAR(50) | OPC UA VariantType 名稱 |
+| `sensor_id` | INTEGER | FK → `sensors(sensor_id)`，可為 NULL；綁定後數值會同步寫入 `sensor_readings` |
+| `current_data` | JSONB | 格式 `{"val": 123.45}` |
+| `quality` | VARCHAR(20) | GOOD / BAD / UNCERTAIN |
+| `plc_state` | VARCHAR(20) | ONLINE / OFFLINE，預設 OFFLINE |
+| `last_update` | TIMESTAMPTZ | — |
 
-## 🖥️ 網頁管理後台（admin_app.py）
+### 時序層（廠區 → 產線 → 設備 → 感測器 → 讀值）
 
-啟動：`streamlit run admin_app.py --server.port <ADMIN_PORT>`（或直接用 `run_all.py` 一起啟動），需輸入 `.env` 設定的帳號密碼登入。
+```
+sites (廠區)
+  └─ production_lines (產線)
+        └─ devices (設備)
+              └─ sensors (感測器)
+                    └─ sensor_readings (時序讀值 hypertable)
+```
 
-| 分頁 | 功能 |
-| --- | --- |
-| 📡 Modbus 點位設定 | 新增/編輯 Modbus 點位連線參數、即時測試讀取、綁定感測器（下拉選單顯示「編號（暱稱）」） |
-| 📡 TIA (S7) 點位設定 | 新增/編輯 S7 點位連線參數、即時測試讀取、綁定感測器 |
-| 📡 OPC UA 點位設定 | 新增/編輯 OPC UA Server、測試連線與瀏覽、手動立即瀏覽寫入資料庫、綁定已採集點位的感測器 |
-| 🧬 感測器階層管理 | 建立廠區 → 產線 → 設備 → 感測器四層資料；感測器清單可直接編輯 `nickname`、`sensor_type`、`unit`、閾值、`state_dictionary` |
-| 🚨 異常監控 | 彙整連線異常（`plc_state ≠ ONLINE`）、數值超出 `min_threshold`/`max_threshold`、資料斷更（超過設定時數沒有新的 `sensor_readings`）三種異常 |
-
-**建議操作順序**：
-
-1. 到「感測器階層管理」由上而下建好階層資料（至少建一個 `sensor`），需要的話填 `nickname`、`state_dictionary`
-2. 回到對應協議分頁，把點位的感測器綁定欄位選好並儲存
-3. 下一輪採集開始後 `sensor_readings` 就會有資料；未綁定的點位不影響原本即時值 / MQTT 功能
-4. 平常巡檢直接看「🚨 異常監控」分頁即可，不用手動下 SQL
+- `sensors.sensor_id` 是連結即時層與時序層的橋樑
+- `sensors` 額外有 `nickname`（顯示暱稱）與 `state_dictionary`（數字轉文字狀態字典）
+- `sensor_readings_translated` view：依 `sensors.state_dictionary` 自動把 `sensor_readings.value`
+  翻譯成對應的文字狀態，查詢時不用自己再 join 一次
 
 ---
 
@@ -290,7 +371,7 @@ opcua_tags      ─┘                          └── devices（設備）
 
 ### Byte Order（位元組順序）
 
-決定單一暫存器（16-bit）內部的 2 個 Byte 誰先誰後。
+決定單一暫存器（16-bit）內部 2 個 Byte 誰先誰後。
 
 - **BIG**：高位元組在前（Modbus 標準預設）
 - **LITTLE**：低位元組在前
@@ -307,213 +388,42 @@ opcua_tags      ─┘                          └── devices（設備）
 | 工業俗稱 | `byte_order` | `word_order` | 備註 |
 | --- | --- | --- | --- |
 | Big Endian (ABCD) | BIG | BIG | Modbus 官方標準 |
-| Word Swap (CDAB) | BIG | LITTLE | 🌟 **台灣電表最常見！** |
-| Byte Swap (BADC) | LITTLE | BIG | - |
+| Word Swap (CDAB) | BIG | LITTLE | 🌟 台灣電表最常見！ |
+| Byte Swap (BADC) | LITTLE | BIG | — |
 | Little Endian (DCBA) | LITTLE | LITTLE | 部分歐美設備 |
-
----
-
-## 常用查詢範例
-
-### 查詢某設備底下所有感測器的最新數值
-
-```sql
-SELECT s.sensor_code, s.nickname, s.unit, r.value, r.reading_time
-FROM sensors s
-JOIN LATERAL (
-    SELECT value, reading_time
-    FROM sensor_readings
-    WHERE sensor_id = s.sensor_id
-    ORDER BY reading_time DESC
-    LIMIT 1
-) r ON true
-WHERE s.device_id = 1;
-```
-
-### 每個 sensor 各拿最新 N 筆（避免單一 sensor 洗版整個查詢結果）
-
-```sql
--- 直接用 ORDER BY sensor_id DESC, reading_time DESC LIMIT 100
--- 如果某個 sensor_id 資料量特別大，會把其他 sensor 都擠出 LIMIT 之外，要注意
-SELECT * FROM (
-    SELECT *, ROW_NUMBER() OVER (PARTITION BY sensor_id ORDER BY reading_time DESC) AS rn
-    FROM sensor_readings
-) t
-WHERE rn <= 5
-ORDER BY sensor_id, reading_time DESC;
-```
-
-### 查詢自動翻譯成文字狀態的歷史資料
-
-```sql
-SELECT * FROM sensor_readings_translated
-WHERE sensor_id = 5
-ORDER BY reading_time DESC
-LIMIT 20;
-```
-
-### 計算某感測器每小時平均值
-
-```sql
-SELECT
-    time_bucket('1 hour', reading_time) AS hour,
-    AVG(value) AS avg_value,
-    MIN(value) AS min_value,
-    MAX(value) AS max_value
-FROM sensor_readings
-WHERE sensor_id = 1
-  AND reading_time > now() - INTERVAL '7 days'
-GROUP BY hour
-ORDER BY hour;
-```
-
-### 檢查是否有感測器超過閾值
-
-```sql
-SELECT s.sensor_code, s.nickname, r.value, s.min_threshold, s.max_threshold, r.reading_time
-FROM sensors s
-JOIN LATERAL (
-    SELECT value, reading_time
-    FROM sensor_readings
-    WHERE sensor_id = s.sensor_id
-    ORDER BY reading_time DESC
-    LIMIT 1
-) r ON true
-WHERE r.value < s.min_threshold OR r.value > s.max_threshold;
-```
-
-### 找出哪些即時層點位還沒綁定 sensor_id
-
-```sql
-SELECT 'modbus' AS source, id, name FROM modbus_scada WHERE sensor_id IS NULL
-UNION ALL
-SELECT 'tia', id, name FROM tia_scada WHERE sensor_id IS NULL
-UNION ALL
-SELECT 'opcua', id, node_id FROM opcua_tags WHERE sensor_id IS NULL;
-```
-
-### 把查詢 session 的顯示時區改成台灣時間
-
-```sql
--- 只在這次連線 session 生效
-SET timezone = 'Asia/Taipei';
-
--- 整個資料庫預設都改（推薦），改完要重新連線才生效
-ALTER DATABASE your_db_name SET timezone TO 'Asia/Taipei';
-```
-
-> `TIMESTAMPTZ` 內部一律用 UTC 儲存，`+00`／`+08` 只是顯示用的時區偏移量，不是資料寫錯，詳見下方疑難排解表。
 
 ---
 
 ## 🔧 模組說明
 
-### `collector/run_modbus_collector.py`
-
-Modbus 的資料擷取主程式。讀值 → 寫回 `modbus_scada`（即時層）→ 依 `sensor_id` 暫存數值（原始數字，非狀態字典文字）→ 批次 flush 進 `sensor_readings`（時序層）。
-
-### `collector/run_s7_collector.py`
-
-TIA_S7 的資料擷取主程式，流程同上。
-
-### `collector/run_opcua_collector.py`
-
-OPC UA 的資料擷取主程式。並行掃描所有啟用中的 Server，upsert 進 `opcua_tags` 時刻意保留既有的 `sensor_id` 綁定，全部掃描完後統一呼叫 `sensor_reading_writer.flush()` 寫入時序層，並依查詢結果併入 `main.py` 的 MQTT 增量上傳。
-
-### `protocols/s7_protocol.py` / `protocols/modbus_protocol.py` / `protocols/opcua_protocol.py`
-
-各協議連線與讀值封裝，維持原始設計未變動。
-
-### `parsers/plc_parser.py` / `parsers/encoder.py`
-
-S7 / Modbus 的位元組解析與線性縮放，維持原始設計未變動。
-
-### `data_layer/db_connector.py`
-
-PostgreSQL 連線池管理器。
-
-### `data_layer/batch_updater.py`
-
-即時層批量更新模組。OPC UA upsert 完後會額外查回這批 `node_id` 目前的 `sensor_id` 綁定狀態，交給 `timeseries_writer` 暫存；目前保留了診斷用的 `logger.info` 級別 log（`🔗`/`🧪` 開頭），確認系統穩定運作後可考慮調降回 `debug`。
-
-### `data_layer/timeseries_writer.py`
-
-時序層寫入模組。依「數值不同才寫、否則心跳補寫」規則，用記憶體快取判斷是否需要寫入 `sensor_readings`，並批次 flush。目前保留了診斷用的 log（`🧾`/`📦`/`🚿` 開頭，含 `writer_id` 物件識別碼），用來排查「有暫存但沒真的寫入」這類問題；確認穩定後可調降回 `debug` 等級，避免點位一多洗版。
-
-### `messaging/mqtt_publisher.py`
-
-MQTT 發送器：處理與 MQTT Broker 的連線、認證與發布，支援 QoS 1，並做增量比對（數值變化才發送）。
-
-### `main.py`
-
-統一主程式入口。整合 S7 / Modbus / OPC UA 三協議，依序執行輪詢、比對、即時層批量更新、時序層寫入，並在 `MQTT_ENABLED=true` 時把三協議資料一併做 MQTT 增量上傳。
-
-### `admin_app.py`
-
-Streamlit 網頁管理後台：連線參數管理、感測器階層與綁定管理（含 nickname / state_dictionary）、異常監控儀表板。需要帳號密碼登入。
-
-### `run_all.py`
-
-同時啟動 `main.py`（採集主程式）與 `admin_app.py`（Streamlit 網頁後台）。
-
----
-
-## 🛠️ 維運建議
-
-### 資料壓縮（選用，資料量成長後再啟用）
-
-```sql
-ALTER TABLE sensor_readings SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'sensor_id'
-);
-
-SELECT add_compression_policy('sensor_readings', INTERVAL '30 days');
-```
-
-### 資料保留策略（選用）
-
-```sql
-SELECT add_retention_policy('sensor_readings', INTERVAL '1 year');
-```
-
-### 定期確認 hypertable 分區狀況
-
-```sql
-SELECT * FROM timescaledb_information.chunks
-WHERE hypertable_name = 'sensor_readings'
-ORDER BY range_start DESC
-LIMIT 10;
-```
-
-### 監控寫入延遲/斷線設備
-
-建議另外撰寫排程（例如用 `pg_cron` 或外部排程工具），定期檢查「超過 N 小時沒有新資料」的感測器；或直接使用網頁後台的「🚨 異常監控」分頁，內建這個功能且時數門檻可調整。
-
----
-
-## ❓ 常見問題排查
-
-| 現象 | 可能原因 | 處理方式 |
-| --- | --- | --- |
-| `permission denied for table xxx` | DB 使用者權限不足 | `GRANT SELECT, INSERT, UPDATE ON xxx TO your_db_user;` |
-| `permission denied for sequence xxx_id_seq` | 序列（sequence）權限跟資料表權限是分開的兩個物件，容易漏授權 | `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO your_db_user;` |
-| `sensor_readings` 一直沒有資料，但 log 也沒有明顯錯誤 | 1) 點位尚未綁定 `sensor_id`；2) `collector/run_opcua_collector.py` 缺少 `sensor_reading_writer.flush()` 呼叫，導致資料停在記憶體緩衝區、程式重啟就消失 | 1) 到 admin_app.py 綁定 `sensor_id`；2) 確認三個 collector 檔案都有 `flush()` 呼叫（可用 `grep -n flush collector/*.py` 確認） |
-| `UNION could not convert type time with time zone to timestamp with time zone` | 某張表（例如 `tia_scada`）的 `last_update` 誤設為 `TIME WITH TIME ZONE`，跟其他表的 `TIMESTAMPTZ` 型態不一致 | 跑 `sql/003_fix_tia_scada_last_update_type.sql` 修正型態 |
-| `reading_time` 顯示 `+00` 而不是台灣的 `+08` | 這不是資料錯誤，`TIMESTAMPTZ` 內部一律以 UTC 儲存，顯示的時區偏移量取決於查詢 session 的 `timezone` 設定 | `ALTER DATABASE your_db_name SET timezone TO 'Asia/Taipei';`（需重新連線生效） |
-| 查詢 `ORDER BY sensor_id DESC, reading_time DESC LIMIT 100` 好像只看到某一個 sensor 的資料 | 該 sensor 資料量已經超過 LIMIT 筆數，把其他 sensor 都擠出結果之外，資料庫裡其實都有 | 改用 `PARTITION BY sensor_id` 的視窗函式查詢（見上方查詢範例），或針對單一 `sensor_id` 查詢 |
-| Modbus 狀態字典的中文文字（如「待機」）沒有進 `sensor_readings` | 屬正常行為，`sensor_readings.value` 只接受數字 | 到 `sensors.state_dictionary` 設定對照表，查詢 `sensor_readings_translated` 這個 view 即可看到翻譯後的文字 |
-| 已設定 `MQTT_ENABLED=false` 仍看到 MQTT 連線 log | `main.py` 裡殘留重複的 `MQTTPublisher()` 初始化程式碼 | 檢查 `main()` 內是否有兩段初始化邏輯，刪除舊的那段，只保留 `if mqtt_enabled: ...` 那組 |
-
----
-
-## 📎 附錄：欄位命名慣例
-
-| 慣例 | 說明 |
+| 模組 | 說明 |
 | --- | --- |
-| `*_id` | 主鍵，皆為流水號 |
-| `*_code` | 對外可見的業務編號（唯一），與內部流水號分開 |
-| `*_time` | 時間戳記，統一使用 `TIMESTAMPTZ`（含時區）避免時區混淆 |
-| `sensor_id` | 即時層三張表用來對應時序層 `sensors` 階層的外鍵，可為 NULL |
-| `nickname` | 人類可讀的暱稱，純粹方便對照識別，不參與任何程式邏輯判斷 |
-| `state_dictionary` | JSONB 格式的「數字代碼 → 文字狀態」對照表，只在查詢/顯示層套用，不影響底層數值儲存 |
+| `collector/run_modbus_collector.py` | Modbus 資料採集主程式，多設備併發連線 |
+| `collector/run_s7_collector.py` | TIA/S7 資料採集主程式，多 PLC 併發連線 |
+| `collector/run_opcua_collector.py` | OPC UA 一次性完整瀏覽採集（獨立腳本，可手動執行測試；`main.py` 平時改用訂閱服務） |
+| `services/opcua_subscription_service.py` | OPC UA 常駐訂閱服務，背景執行緒 + 專屬 asyncio event loop |
+| `protocols/s7_protocol.py` | 西門子 S7 協議封裝（`snap7`），DB 區塊打包讀取 |
+| `protocols/modbus_protocol.py` | Modbus TCP 協議封裝（`pymodbus`） |
+| `protocols/opcua_protocol.py` | OPC UA 協議封裝（`asyncua`）：連線、遞迴瀏覽、單節點讀取 |
+| `parsers/plc_parser.py` | S7 位元組解析、線性縮放 |
+| `parsers/encoder.py` | Modbus Big/Little Endian 編解碼 |
+| `data_layer/db_connector.py` | PostgreSQL 連線池（`ThreadedConnectionPool`，執行緒安全） |
+| `data_layer/batch_updater.py` | 批量寫入（`execute_values` UPDATE/UPSERT），含訂閱模式專用輕量版 |
+| `messaging/mqtt_publisher.py` | MQTT 發送器，增量比對、心跳全量上傳、自動重連 |
+| `main.py` | 主程式入口：Modbus/TIA 併發輪詢 + 啟動 OPC UA 訂閱服務 + MQTT 上傳 |
+| `admin_app.py` | 網頁管理後台（Streamlit），5 個分頁：Modbus / TIA / OPC UA / 感測器階層管理 / 異常監控 |
+| `run_all.py` | 同時啟動 `main.py` 與 `admin_app.py` |
+
+---
+
+## 🩺 常見問題排查
+
+| 現象 | 可能原因 |
+| --- | --- |
+| OPC UA 網頁按了「立即瀏覽」但訂閱服務沒反應 | 確認已跑過 `005_opcua_resubscribe_flag.sql`；確認 `main.py` 是用新版啟動（背景訂閱服務有印出「🚀 [訂閱服務] ... 已啟動」的 log） |
+| 新增 OPC UA Server 後網頁看得到，但一直沒有數值 | 新 Server 需要重啟 `main.py` 才會被訂閱服務接手，請重啟後觀察 log |
+| `state_dictionary` 存檔報 `invalid input syntax for type json` | 請填合法 JSON（雙引號），或直接重新整理頁面讓表格重新載入；系統已內建正規化邏輯，多數情況可自動修正 |
+| 資料庫報 permission denied | 檢查該資料庫使用者是否對相關表**和序列 (sequence)** 都有 GRANT，兩者要分開授權 |
+| Modbus/TIA 某台設備離線時，其他設備也被拖慢 | 確認 `db_connector.py` 已改用 `ThreadedConnectionPool`，且各採集腳本使用的是併發版本（`_collect_one_device` / `_collect_one_plc`） |
+| 儲存綁定時被擋下、提示「已被其他點位使用」 | 這是跨協議重複綁定偵測在運作，同一個感測器不能同時綁兩個點位；訊息會標明是哪個點位（例如 `modbus_scada.12`）佔用了該感測器，先去那個點位解除綁定（改選「（未綁定）」）再重新綁定 |
+| 「單筆新增 Modbus 點位」以前送出後失敗或寫入怪資料 | 舊版程式碼欄位順序跟參數順序沒對齊（`unit` 誤植到 `function_code` 位置，導致後面全部欄位錯位），目前版本已修正對齊，若還在用更早期的檔案請直接替換成最新版 `admin_app.py` |

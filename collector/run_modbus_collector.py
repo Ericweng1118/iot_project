@@ -4,6 +4,7 @@ import struct
 import json
 from datetime import datetime
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from data_layer.db_connector import DatabaseConnector
 from protocols.modbus_protocol import ModbusTCPCollector
@@ -15,6 +16,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+
+# 併發連線的最大執行緒數上限（同時連線的設備台數上限，避免瞬間開太多 socket）
+MAX_WORKERS = 8
 
 # ----------------------------------------------------
 # 🔍 核心工具 1：依據 data_type 自動判定所需的暫存器數量
@@ -142,8 +146,117 @@ def update_scada_results(results):
     except Exception as e:
         logger.error(f"寫入 modbus_scada 失敗: {e}")
 
+
 # ----------------------------------------------------
-# 🚀 主程式執行邏輯
+# 🚀 單一設備採集邏輯（在獨立執行緒中執行）
+# ----------------------------------------------------
+def _collect_one_device(plc_ip, plc_port, slave_id, device_tags, now):
+    """
+    處理單一台設備 (plc_ip, plc_port, slave_id) 底下所有點位的採集。
+    回傳這台設備產生的 results 清單，供最後統一批次寫入資料庫。
+    這台設備連線逾時或失敗，只會拖慢自己這條執行緒，不影響其他設備。
+    """
+    results = []
+    collector = ModbusTCPCollector(host=plc_ip, port=plc_port, slave_id=slave_id)
+
+    # 連線失敗：該設備下所有點位自動標註為 OFFLINE
+    if not collector.connect():
+        logger.error(
+            f"❌ 無法連線至 PLC [{plc_ip}:{plc_port}] (Slave ID={slave_id})"
+        )
+        for tag in device_tags:
+            results.append((None, None, "OFFLINE", now, tag["id"]))
+        return results
+
+    # 連線成功：開始依 function_code 讀取暫存器
+    for tag in device_tags:
+        fc = tag["function_code"]
+        addr = tag["start_address"]
+        dt = tag["data_type"]
+        count = get_register_count(dt)
+
+        regs = None
+        try:
+            if fc == 1:
+                regs = collector.read_coils(address=addr, count=1)
+            elif fc == 2:
+                regs = collector.read_discrete_inputs(
+                    address=addr, count=1
+                )
+            elif fc == 3:
+                regs = collector.read_holding_registers(
+                    address=addr, count=count
+                )
+            elif fc == 4:
+                regs = collector.read_input_registers(
+                    address=addr, count=count
+                )
+        except Exception as e:
+            logger.error(f"讀取點位 [{tag['name']}] 失敗: {e}")
+
+        if regs is not None:
+            # 1. 解碼暫存器原始數值
+            raw_val = parse_registers(
+                regs, dt, tag["byte_order"], tag["word_order"]
+            )
+
+            # 2. 進行工程 Scaling 計算
+            final_val = apply_linear_scaling(
+                raw_val,
+                tag["raw_min"],
+                tag["raw_max"],
+                tag["eng_min"],
+                tag["eng_max"],
+            )
+
+            if final_val is not None:
+                rounded_val = round(final_val, 4)
+                val_for_payload = rounded_val
+
+                # 3. 狀態字典 Mapping：若匹配成功，直接將 val 替換為狀態文字
+                state_dict = tag["state_dictionary"]
+                if state_dict and isinstance(state_dict, dict):
+                    str_key = (
+                        str(int(final_val))
+                        if hasattr(final_val, "is_integer")
+                        and final_val.is_integer()
+                        else str(final_val)
+                    )
+                    if str_key in state_dict:
+                        val_for_payload = state_dict[
+                            str_key
+                        ]  # 直接覆蓋為文字
+
+                # 4. 封裝 JSON Payload (val 直接為數字或轉換後的文字)
+                current_data_payload = {"val": val_for_payload}
+
+                logger.info(
+                    f"   └─ 📊 [{tag['name']}] (ID:{tag['id']}) ="
+                    f" {final_val} | JSON: {current_data_payload}"
+                )
+
+                results.append((
+                    rounded_val,  # 數值欄位 (current_value) 依然保留原始數字供數據分析
+                    json.dumps(
+                        current_data_payload, ensure_ascii=False
+                    ),  # ensure_ascii=False 避免中文變成 unicode 碼
+                    "ONLINE",
+                    now,
+                    tag["id"],
+                ))
+            else:
+                results.append(
+                    (None, None, "ERROR", now, tag["id"])
+                )
+        else:
+            results.append((None, None, "ERROR", now, tag["id"]))
+
+    collector.disconnect()
+    return results
+
+
+# ----------------------------------------------------
+# 🚀 主程式執行邏輯（多台設備併發版本）
 # ----------------------------------------------------
 def main():
     if not DatabaseConnector.initialize_pool():
@@ -159,7 +272,7 @@ def main():
 
     logger.info(
         f"📋 成功載入 {len(tags)} 個 SCADA"
-        " 點位，準備按 IP/Port/Slave 分組連線..."
+        " 點位，準備按 IP/Port/Slave 分組併發連線..."
     )
 
     # 按 (plc_ip, plc_port, slave_id) 分組，減少重複開啟建立 Socket 的開銷
@@ -171,106 +284,23 @@ def main():
     results_to_update = []
     now = datetime.now()
 
-    for (plc_ip, plc_port, slave_id), device_tags in grouped_tags.items():
-        collector = ModbusTCPCollector(
-            host=plc_ip, port=plc_port, slave_id=slave_id
-        )
+    # 併發連線多台設備：每台設備各自跑在獨立執行緒，
+    # 某一台離線卡在 connect timeout 不會拖到其他台的採集
+    worker_count = min(MAX_WORKERS, len(grouped_tags)) or 1
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_key = {
+            executor.submit(
+                _collect_one_device, plc_ip, plc_port, slave_id, device_tags, now
+            ): (plc_ip, plc_port, slave_id)
+            for (plc_ip, plc_port, slave_id), device_tags in grouped_tags.items()
+        }
 
-        # 連線失敗：該設備下所有點位自動標註為 OFFLINE
-        if not collector.connect():
-            logger.error(
-                f"❌ 無法連線至 PLC [{plc_ip}:{plc_port}] (Slave ID={slave_id})"
-            )
-            for tag in device_tags:
-                results_to_update.append(
-                    (None, None, "OFFLINE", now, tag["id"])
-                )
-            continue
-
-        # 連線成功：開始依 function_code 讀取暫存器
-        for tag in device_tags:
-            fc = tag["function_code"]
-            addr = tag["start_address"]
-            dt = tag["data_type"]
-            count = get_register_count(dt)
-
-            regs = None
+        for future in as_completed(future_to_key):
+            key = future_to_key[future]
             try:
-                if fc == 1:
-                    regs = collector.read_coils(address=addr, count=1)
-                elif fc == 2:
-                    regs = collector.read_discrete_inputs(
-                        address=addr, count=1
-                    )
-                elif fc == 3:
-                    regs = collector.read_holding_registers(
-                        address=addr, count=count
-                    )
-                elif fc == 4:
-                    regs = collector.read_input_registers(
-                        address=addr, count=count
-                    )
+                results_to_update.extend(future.result())
             except Exception as e:
-                logger.error(f"讀取點位 [{tag['name']}] 失敗: {e}")
-
-            if regs is not None:
-                # 1. 解碼暫存器原始數值
-                raw_val = parse_registers(
-                    regs, dt, tag["byte_order"], tag["word_order"]
-                )
-
-                # 2. 進行工程 Scaling 計算
-                final_val = apply_linear_scaling(
-                    raw_val,
-                    tag["raw_min"],
-                    tag["raw_max"],
-                    tag["eng_min"],
-                    tag["eng_max"],
-                )
-
-                if final_val is not None:
-                    rounded_val = round(final_val, 4)
-                    val_for_payload = rounded_val
-
-                    # 3. 狀態字典 Mapping：若匹配成功，直接將 val 替換為狀態文字
-                    state_dict = tag["state_dictionary"]
-                    if state_dict and isinstance(state_dict, dict):
-                        str_key = (
-                            str(int(final_val))
-                            if hasattr(final_val, "is_integer")
-                            and final_val.is_integer()
-                            else str(final_val)
-                        )
-                        if str_key in state_dict:
-                            val_for_payload = state_dict[
-                                str_key
-                            ]  # 直接覆蓋為文字
-
-                    # 4. 封裝 JSON Payload (val 直接為數字或轉換後的文字)
-                    current_data_payload = {"val": val_for_payload}
-
-                    logger.info(
-                        f"   └─ 📊 [{tag['name']}] (ID:{tag['id']}) ="
-                        f" {final_val} | JSON: {current_data_payload}"
-                    )
-
-                    results_to_update.append((
-                        rounded_val,  # 數值欄位 (current_value) 依然保留原始數字供數據分析
-                        json.dumps(
-                            current_data_payload, ensure_ascii=False
-                        ),  # ensure_ascii=False 避免中文變成 unicode 碼
-                        "ONLINE",
-                        now,
-                        tag["id"],
-                    ))
-                else:
-                    results_to_update.append(
-                        (None, None, "ERROR", now, tag["id"])
-                    )
-            else:
-                results_to_update.append((None, None, "ERROR", now, tag["id"]))
-
-        collector.disconnect()
+                logger.error(f"設備 {key} 採集執行緒發生未預期例外: {e}", exc_info=True)
 
     # 批次更新回資料庫
     update_scada_results(results_to_update)

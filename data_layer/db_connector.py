@@ -2,7 +2,7 @@ import os
 import logging
 from contextlib import contextmanager
 import psycopg2
-from psycopg2.pool import SimpleConnectionPool
+from psycopg2.pool import ThreadedConnectionPool
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,16 +18,18 @@ class DatabaseConnector:
             return True
 
         try:
-            cls._pool = SimpleConnectionPool(
+            # 🔥 改用 ThreadedConnectionPool：支援多執行緒併發同時取用連線
+            #    （SimpleConnectionPool 不是執行緒安全的，多執行緒併發採集時會出問題）
+            cls._pool = ThreadedConnectionPool(
                 minconn=1,
-                maxconn=10,
+                maxconn=20,  # 併發執行緒變多，連線數上限適度調高（原本 10）
                 host=os.getenv("DB_HOST"),
                 port=int(os.getenv("DB_PORT", 5432)),  # 轉成 int 避免型態錯誤
                 database=os.getenv("DB_NAME"),
                 user=os.getenv("DB_USER"),
                 password=os.getenv("DB_PASSWORD")
             )
-            logger.info("PostgreSQL 連線池初始化成功。")
+            logger.info("PostgreSQL 連線池初始化成功 (ThreadedConnectionPool，支援多執行緒併發)。")
             return True  # 👈 🔥 關鍵修正：成功時傳回 True
 
         except Exception as e:
