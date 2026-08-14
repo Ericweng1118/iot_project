@@ -7,6 +7,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from data_layer.db_connector import DatabaseConnector
+from data_layer.timeseries_writer import sensor_reading_writer
 from protocols.modbus_protocol import ModbusTCPCollector
 
 # 配置 日誌
@@ -106,7 +107,7 @@ def fetch_scada_tags():
     sql = """
         SELECT id, name, plc_ip, plc_port, slave_id, function_code, 
                start_address, data_type, raw_min, raw_max, eng_min, eng_max,
-               byte_order, word_order, state_dictionary
+               byte_order, word_order, state_dictionary, sensor_id
         FROM modbus_scada;
     """
     try:
@@ -235,6 +236,11 @@ def _collect_one_device(plc_ip, plc_port, slave_id, device_tags, now):
                     f" {final_val} | JSON: {current_data_payload}"
                 )
 
+                # 5. 若此點位已綁定感測器，把「原始數值」(rounded_val) 送進
+                #    時序寫入器暫存；stage() 內部會依規則判斷是否真的要寫入
+                #    （首次出現 / 數值變化 / 心跳補寫），這裡不用自己判斷。
+                sensor_reading_writer.stage(tag.get("sensor_id"), rounded_val, now)
+
                 results.append((
                     rounded_val,  # 數值欄位 (current_value) 依然保留原始數字供數據分析
                     json.dumps(
@@ -304,7 +310,17 @@ def main():
 
     # 批次更新回資料庫
     update_scada_results(results_to_update)
+
+    # 把這一輪暫存的感測器數值批次寫進 sensor_readings 時序表
+    # （不管是被 main.py 呼叫，或單獨執行本檔案測試，都會在這裡自行 flush，
+    #  確保時序資料不會漏寫）
+    sensor_reading_writer.flush()
     logger.info("🏁 本輪 Modbus SCADA 數據採集與更新完畢。\n")
 
 if __name__ == "__main__":
+    # 獨立執行本檔案時（不透過 main.py 排程），先載入時序寫入器的初始快取，
+    # 確保心跳補寫的時間判斷是接續資料庫裡既有的資料，不會從頭算。
+    # （透過 main.py 啟動時，這個快取只在 main.py 啟動當下載入一次即可，
+    #  不需要也不應該每輪都重載，所以特意放在這裡而不是 main() 內部。）
+    sensor_reading_writer.load_initial_cache()
     main()

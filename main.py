@@ -26,8 +26,14 @@ except ValueError:
     logging.warning(f"⚠️ POLL_INTERVAL 讀取失敗 ('{raw_interval}')，改用預設值 5.0 秒")
     POLL_INTERVAL = 5.0
 
+# 讀取 MQTT 是否啟用（🔧 修正：先前版本完全沒讀取這個環境變數，
+# 導致 MQTT_ENABLED=false 時 MQTTPublisher 仍然無條件被建立、無條件發送）
+raw_mqtt_enabled = os.getenv("MQTT_ENABLED", "true").split('#')[0].strip().lower()
+MQTT_ENABLED = raw_mqtt_enabled not in ("false", "0", "no", "off")
+
 # 匯入 DB 與 MQTT 模組
 from data_layer.db_connector import DatabaseConnector
+from data_layer.timeseries_writer import sensor_reading_writer
 from messaging.mqtt_publisher import MQTTPublisher
 
 # 匯入採集模組
@@ -36,6 +42,7 @@ try:
     from collector.run_modbus_collector import main as run_modbus_collector
     from collector.run_s7_collector import collect_s7_data as run_tia_collector
     from services.opcua_subscription_service import OPCUASubscriptionService
+
 except ImportError as e:
     logging.error(f"❌ 匯入採集模組失敗: {e}")
     sys.exit(1)
@@ -146,12 +153,21 @@ def main():
         logging.error("❌ PostgreSQL 連線池初始化失敗，主服務無法啟動！")
         return
 
-    # 2. 初始化 MQTT Publisher
+    # 1.5 載入時序寫入器（sensor_readings）的初始快取：
+    #     把每個已綁定感測器目前資料庫裡最新一筆數值/時間讀回來，
+    #     避免程式重啟後，心跳補寫的時間判斷從頭算、導致短時間內
+    #     誤判「數值沒變也要寫」而灌入一堆不必要的心跳資料。
+    sensor_reading_writer.load_initial_cache()
+
+    # 2. 初始化 MQTT Publisher（尊重 MQTT_ENABLED 開關，false 時完全不建立連線、不發送任何訊息）
     mqtt_pub = None
-    try:
-        mqtt_pub = MQTTPublisher()
-    except Exception as e:
-        logging.error(f"⚠️ MQTT 客戶端初始化失敗: {e}")
+    if MQTT_ENABLED:
+        try:
+            mqtt_pub = MQTTPublisher()
+        except Exception as e:
+            logging.error(f"⚠️ MQTT 客戶端初始化失敗: {e}")
+    else:
+        logging.info("🔕 MQTT_ENABLED=false，本次啟動不會建立 MQTT 連線、也不會發送任何訊息。")
 
     # 3. 啟動 OPC UA 訂閱服務（獨立背景執行緒，跟下方主迴圈完全脫鉤）
     opcua_service = OPCUASubscriptionService()

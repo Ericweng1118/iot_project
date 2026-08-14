@@ -2,6 +2,7 @@ import logging
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from dotenv import load_dotenv
 import sys
 
@@ -23,6 +24,7 @@ load_dotenv()
 
 from data_layer.db_connector import DatabaseConnector
 from data_layer.batch_updater import batch_update_tia_data
+from data_layer.timeseries_writer import sensor_reading_writer
 from protocols.s7_protocol import SiemensS7Collector
 from parsers.plc_parser import parse_s7_value
 
@@ -45,7 +47,7 @@ def get_s7_type_size(data_type):
 def load_plc_configs():
     """從資料庫撈出所有需要採集的 S7 點位參數"""
     query = """
-        SELECT id, name, plc_ip, db_number, "offset", data_type 
+        SELECT id, name, plc_ip, db_number, "offset", data_type, sensor_id
         FROM tia_scada;
     """
     try:
@@ -63,7 +65,8 @@ def load_plc_configs():
                 "plc_ip": row[2],
                 "db_number": row[3],
                 "offset": row[4],
-                "data_type": row[5]
+                "data_type": row[5],
+                "sensor_id": row[6]
             })
         return configs
     except Exception as e:
@@ -86,6 +89,7 @@ def _collect_one_plc(plc_ip, db_groups):
     這台 PLC 連線逾時或失敗，只會拖慢自己這條執行緒，不影響其他 PLC。
     """
     rows = []
+    now = datetime.now()
     collector = SiemensS7Collector(ip=plc_ip)
 
     if not collector.connect():
@@ -130,6 +134,11 @@ def _collect_one_plc(plc_ip, db_groups):
                     parsed_value = round(parsed_value, 2)  # 浮點數四捨五入優化
 
                 logger.debug(f"解析成功 -> {p['name']}: {parsed_value}")
+
+                # 若此點位已綁定感測器，把數值送進時序寫入器暫存；
+                # stage() 內部會依規則判斷是否真的要寫入
+                # （首次出現 / 數值變化 / 心跳補寫）。
+                sensor_reading_writer.stage(p.get("sensor_id"), parsed_value, now)
 
                 # 放入準備更新的陣列 (id, current_data_dict, plc_state)
                 rows.append((p["id"], {"val": parsed_value}, "ONLINE"))
@@ -181,11 +190,18 @@ def collect_s7_data():
         batch_update_tia_data(all_update_rows)
         logger.info("資料庫批次寫入完成。")
 
+    # 把這一輪暫存的感測器數值批次寫進 sensor_readings 時序表
+    sensor_reading_writer.flush()
+
 if __name__ == "__main__":
     try:
         # 初始化連線池
         DatabaseConnector.initialize_pool()
-        
+
+        # 獨立執行本檔案時（不透過 main.py 排程），先載入時序寫入器的初始快取，
+        # 確保心跳補寫的時間判斷是接續資料庫裡既有的資料，不會從頭算。
+        sensor_reading_writer.load_initial_cache()
+
         # 執行單次採集測試
         collect_s7_data()
         

@@ -43,6 +43,16 @@ OPC UA 不再像 Modbus/TIA 一樣每輪重新輪詢，而是常駐一個獨立�
 - 網頁「感測器階層管理」分頁可直接維護這整條階層
 - Modbus / TIA / OPC UA 三個點位設定分頁都有「綁定感測器」下拉選單，並內建**跨協議重複綁定偵測**，
   避免同一個感測器被兩個不同點位同時綁定
+- **`sensor_readings` 寫入規則**（由 `data_layer/timeseries_writer.py` 的 `SensorReadingWriter` 負責）：
+  並不是每次採集到數值就無腦寫入，而是符合以下任一條件才寫：
+  1. 該 `sensor_id` 第一次出現
+  2. 新值與快取中的上一筆數值不同
+  3. 數值相同，但距離上次寫入超過心跳週期（`SENSOR_HEARTBEAT_INTERVAL`，預設 3600 秒）——證明沒斷線
+  
+  判斷全部在記憶體做（服務啟動時會把每個 sensor 目前資料庫裡最新一筆讀回來當快取），
+  避免每輪都要查一次 DB。三個協議（Modbus / TIA / OPC UA 訂閱服務）共用同一個
+  `sensor_reading_writer` 單例，內部用 `threading.Lock` 保護，多執行緒/背景服務同時
+  呼叫也安全。
 
 ### 5. 異常監控
 
@@ -55,7 +65,7 @@ OPC UA 不再像 Modbus/TIA 一樣每輪重新輪詢，而是常駐一個獨立�
 ### 6. 數據增量上傳 (Report by Exception)
 
 MQTT 端同樣採用增量發送：快取上一輪的值，只有數值變化時才發送，並定期強制全量心跳上傳，
-節省頻寬與 Broker 負載。
+節省頻寬與 Broker 負載。`.env` 的 `MQTT_ENABLED=false` 可完全關閉 MQTT（不建立連線、不發送任何訊息）。
 
 ### 7. PostgreSQL 批量更新
 
@@ -77,7 +87,8 @@ OPC UA 訂閱模式另外提供輕量版 `batch_update_opcua_values`，只更新
 │   └── encoder.py                # Modbus 編碼/解碼（32/64 位元支援）
 ├── data_layer/                   # 數據層
 │   ├── db_connector.py           # PostgreSQL 連線池管理（ThreadedConnectionPool）
-│   └── batch_updater.py          # 批量更新邏輯（execute_values）
+│   ├── batch_updater.py          # 批量更新邏輯（execute_values），即時層專用
+│   └── timeseries_writer.py      # sensor_readings 時序寫入器（SensorReadingWriter 單例）
 ├── messaging/                    # 訊息通訊層
 │   └── mqtt_publisher.py         # MQTT 發送器（自動連線、失敗重試、增量上傳）
 ├── services/                     # 常駐背景服務
@@ -120,6 +131,7 @@ DB_USER=your_username
 DB_PASSWORD=your_password
 
 # ===== MQTT 伺服器設定 =====
+MQTT_ENABLED=true            # 設為 false 可完全關閉 MQTT：不建立連線、不發送任何訊息
 MQTT_BROKER=192.168.x.x
 MQTT_PORT=1883
 MQTT_USER=your_mqtt_user
@@ -130,6 +142,10 @@ MQTT_TOPIC=iot-2/evt/wadata/fmt/scada_unified
 # ===== 採集服務週期設定 =====
 # 僅套用於 Modbus / TIA(S7)；OPC UA 改由常駐訂閱服務即時處理，不受此週期影響
 POLL_INTERVAL="60.0"
+
+# ===== sensor_readings 時序寫入設定 =====
+# 數值沒有變化時，最少多久還是要補寫一筆進 sensor_readings 當作心跳（單位：秒）
+SENSOR_HEARTBEAT_INTERVAL="3600"
 
 # ===== 網頁小工具入口帳號、密碼、PORT =====
 ADMIN_USER=user
@@ -161,6 +177,15 @@ python main.py          # 只跑採集主服務
 python run_all.py       # 同時跑採集主服務 + 網頁管理後台
 ```
 
+> ⚠️ `run_all.py` 啟動 Streamlit 時使用 `sys.executable -m streamlit`，
+> 而不是直接呼叫 `streamlit` 指令——後者是照系統 `PATH` 找指令，若執行
+> `run_all.py` 的 Python 直譯器所在虛擬環境沒有被加進 PATH（例如用 IDE
+> 執行按鈕、桌面捷徑啟動、忘記先 `source .venv/bin/activate`），會噴
+> `FileNotFoundError: [Errno 2] No such file or directory: 'streamlit'`。
+> 用 `-m streamlit` 明確指定用啟動 `run_all.py` 的那顆直譯器執行，不受
+> PATH 影響。若換了這個寫法還是報同樣的錯，代表虛擬環境本身沒裝
+> streamlit（`pip show streamlit` 確認）。
+
 ### 5. Docker 容器化執行
 
 ```bash
@@ -191,12 +216,15 @@ docker run -d --name unified_collector --env-file .env unified_collector:latest
 ```
 服務啟動
   └─ 對每一台 enabled=TRUE 的 Server：
-        ├─ 連線
+        ├─ 連線（重複使用同一條 session，瀏覽時不再另外開新連線，見下方 Session 數說明）
         ├─ 有快取點位表就直接用；沒有才做一次完整 browse 並寫入 opcua_tags
         ├─ 建立 Subscription，監控所有已知點位
-        ├─ 背景 task 1：每 2 秒把收到的變化批次 flush 進資料庫
+        ├─ 背景 task 1：每 2 秒把收到的變化批次 flush 進 opcua_tags，
+        │              並同步把已綁定感測器的點位 stage 進時序寫入器、批次寫進 sensor_readings
         ├─ 背景 task 2：每 5 秒檢查一次「是否有人請求重新整理點位表」
-        └─ 每 15 秒讀一次 ServerStatus 節點當心跳；讀取失敗 → 判定斷線 → 退避重連
+        ├─ 背景 task 3：每 10 秒重新讀取一次 sensor_id 綁定狀態
+        │              （綁定可隨時在網頁改，跟「要不要重新瀏覽」是獨立的兩件事）
+        └─ 定期讀一次心跳目標節點確認連線存活；讀取失敗 → 判定斷線 → 退避重連
 ```
 
 **新增點位 / 移除點位的流程：**
@@ -209,10 +237,42 @@ docker run -d --name unified_collector --env-file .env unified_collector:latest
 
 整個過程**不需要重啟任何服務**。
 
+**心跳機制的設計取捨：**
+心跳目標優先使用「已經訂閱成功的實際點位」（訂閱成功代表這個節點肯定存在、讀得到），
+沒有任何點位時才退回系統節點 `i=2258`（`ServerStatus_CurrentTime`）。
+**不要**用 `i=2259`（`ServerStatus` 底下的 `State` 子節點）當心跳目標——不是所有
+OPC UA Server（尤其 PLC 內建的簡化版 Server，例如 open62541-based 的嵌入式裝置）
+都完整實作這個子節點，讀取失敗會被誤判成斷線，導致訂閱被反覆砍掉重建，真正的
+資料變化反而容易在重建過程中被錯過。
+
+**Session 數限制的處理：**
+部分 OPC UA Server（尤其 PLC 內建的簡化版 Server）能同時容許的連線數（Session）很少，
+常見錯誤是 `BadTooManySessions`。本服務兩個作法降低踩雷機率：
+
+1. 首次瀏覽 / 重新整理點位表時，重複使用訂閱服務本身已經開好的那條連線去瀏覽，
+   不會像早期版本呼叫 `scan_server()` 那樣另外多開一條連線
+2. 偵測到 `BadTooManySessions` 這類錯誤時，改用較長的固定等待時間（120 秒）才重試，
+   而不是一般斷線的短間隔重連——因為這種情況通常代表 Server 端還有殘留連線尚未逾時
+   釋放，重試太快只會一直搶不到名額。若持續發生，代表 Server 端已經累積殭屍連線，
+   **需要重啟該設備 / 其 OPC UA 服務**才能讓客戶端這邊強制清空，程式本身無法從外部
+   強制關閉它已經遺失控制的舊連線
+
+**log 雜訊處理：**
+`asyncua` 套件內部會把每一次 Publish Response 的完整原始內容用自己的 logger 印出來，
+且不受 root logger 等級限制，頻率跟訂閱的 publish interval 一樣密集，容易把真正有用
+的錯誤訊息淹沒。本服務啟動時會把 `logging.getLogger("asyncua")` 的等級調到 `WARNING`，
+只留下我們自己的結構化 log（連線成功/失敗、心跳、重連、批次寫入筆數等）。
+
+**動態偵測 Server 清單：**
+訂閱服務每 15 秒（`SERVER_LIST_REFRESH_INTERVAL`）會重新讀一次 `opcua_servers`，
+跟目前正在監控的 Server 清單比對差異：新增的 Server 自動開始監控、被刪除或
+`enabled` 被關掉的 Server 自動停止監控、連線參數（IP/Port/帳密/安全性原則/
+`root_node_id`/`browse_depth`）有變更的 Server 會自動取消舊任務、用新設定重新
+啟動。新增 Server、刪除 Server、改連線參數，這些操作**都不需要重啟 `main.py`**，
+最慢 15 秒內就會生效。
+
 **已知限制：**
 
-- 新增一台**全新**的 OPC UA Server，或修改 Server 的連線參數（IP/Port/帳密/安全性原則）、
-  或切換 `enabled` 開關，訂閱服務目前不會動態偵測，需要**重新啟動 `main.py`** 才會套用
 - 點位從 Server 端移除後，`opcua_tags` 裡的舊資料列不會自動刪除，只會停止更新數值
 
 ---
@@ -239,9 +299,10 @@ docker run -d --name unified_collector --env-file .env unified_collector:latest
 
 ### 分頁 3：📡 OPC UA 點位設定
 
-- **Server 清單**：可編輯連線參數，但**變更連線參數需要重啟 main.py 才會套用**
+- **Server 清單**：可編輯連線參數（IP/Port/帳密/安全性原則等），訂閱服務會在 15 秒內
+  自動偵測到變更並重新連線套用，不需要重啟 `main.py`
 - **新增 Server**：填完連線資訊可先「🧪 測試連線與瀏覽」預覽會抓到哪些點位，確認無誤再「新增 Server」；
-  新 Server 一樣需要重啟 main.py，訂閱服務才會開始監控
+  訂閱服務同樣會在 15 秒內自動偵測到並開始監控，不需要重啟
 - **手動瀏覽**：針對已存在的 Server，「🚀 立即瀏覽並寫入資料庫」可以立即重新整理點位表，
   完成後會自動通知訂閱服務更新監控內容，通常幾秒內生效
 - **已採集的點位資料**：可依 Server 篩選檢視目前所有點位的即時數值，並有「綁定感測器」欄位可編輯，
@@ -409,6 +470,7 @@ sites (廠區)
 | `parsers/encoder.py` | Modbus Big/Little Endian 編解碼 |
 | `data_layer/db_connector.py` | PostgreSQL 連線池（`ThreadedConnectionPool`，執行緒安全） |
 | `data_layer/batch_updater.py` | 批量寫入（`execute_values` UPDATE/UPSERT），含訂閱模式專用輕量版 |
+| `data_layer/timeseries_writer.py` | `SensorReadingWriter` 單例：依規則把數值批次寫進 `sensor_readings`，三協議共用，執行緒安全 |
 | `messaging/mqtt_publisher.py` | MQTT 發送器，增量比對、心跳全量上傳、自動重連 |
 | `main.py` | 主程式入口：Modbus/TIA 併發輪詢 + 啟動 OPC UA 訂閱服務 + MQTT 上傳 |
 | `admin_app.py` | 網頁管理後台（Streamlit），5 個分頁：Modbus / TIA / OPC UA / 感測器階層管理 / 異常監控 |
@@ -421,9 +483,16 @@ sites (廠區)
 | 現象 | 可能原因 |
 | --- | --- |
 | OPC UA 網頁按了「立即瀏覽」但訂閱服務沒反應 | 確認已跑過 `005_opcua_resubscribe_flag.sql`；確認 `main.py` 是用新版啟動（背景訂閱服務有印出「🚀 [訂閱服務] ... 已啟動」的 log） |
-| 新增 OPC UA Server 後網頁看得到，但一直沒有數值 | 新 Server 需要重啟 `main.py` 才會被訂閱服務接手，請重啟後觀察 log |
+| 新增 OPC UA Server 後網頁看得到，但一直沒有數值 | 訂閱服務會在 15 秒內自動偵測新 Server 並開始監控，稍等一下觀察 log 是否出現「🆕 [訂閱服務] 偵測到新的 OPC UA Server」；仍沒有的話再確認連線參數是否正確 |
 | `state_dictionary` 存檔報 `invalid input syntax for type json` | 請填合法 JSON（雙引號），或直接重新整理頁面讓表格重新載入；系統已內建正規化邏輯，多數情況可自動修正 |
 | 資料庫報 permission denied | 檢查該資料庫使用者是否對相關表**和序列 (sequence)** 都有 GRANT，兩者要分開授權 |
 | Modbus/TIA 某台設備離線時，其他設備也被拖慢 | 確認 `db_connector.py` 已改用 `ThreadedConnectionPool`，且各採集腳本使用的是併發版本（`_collect_one_device` / `_collect_one_plc`） |
 | 儲存綁定時被擋下、提示「已被其他點位使用」 | 這是跨協議重複綁定偵測在運作，同一個感測器不能同時綁兩個點位；訊息會標明是哪個點位（例如 `modbus_scada.12`）佔用了該感測器，先去那個點位解除綁定（改選「（未綁定）」）再重新綁定 |
 | 「單筆新增 Modbus 點位」以前送出後失敗或寫入怪資料 | 舊版程式碼欄位順序跟參數順序沒對齊（`unit` 誤植到 `function_code` 位置，導致後面全部欄位錯位），目前版本已修正對齊，若還在用更早期的檔案請直接替換成最新版 `admin_app.py` |
+| OPC UA log 被大量 `SourceTimestamp=... ServerTimestamp=...` 這類原始資料洗版 | 這是 `asyncua` 套件內部 logger 在印每一次 Publish Response，跟我們自己的邏輯無關；確認 `opcua_subscription_service.py` 開頭有 `logging.getLogger("asyncua").setLevel(logging.WARNING)`，沒有的話請更新到最新版檔案 |
+| OPC UA 訂閱反覆重連，log 顯示每 15 秒左右一次斷線 | 心跳目標節點設定有問題，確認心跳讀的是 `heartbeat_node_id`（優先用實際訂閱點位，其次才是 `i=2258`），**不要**用 `i=2259`——不是所有 Server 都實作這個子節點 |
+| OPC UA 出現 `BadTooManySessions` 反覆連不上 | 該 Server 的 Session 數上限很低，且可能已有殘留連線卡住；先重啟該設備 / 其 OPC UA 服務清空殭屍連線，並確認訂閱服務是用最新版（瀏覽時重複使用同一條連線、遇到此錯誤會退避 120 秒），必要時到設備設定裡調高 `MaxSessions` |
+| `MQTT_ENABLED=false` 但還是一直送 MQTT | 確認 `main.py` 有讀取 `MQTT_ENABLED` 環境變數（開頭應該有 `MQTT_ENABLED = os.getenv(...)` 這行），且 `MQTTPublisher()` 是包在 `if MQTT_ENABLED:` 裡才建立，舊版檔案沒有這個判斷 |
+| `run_all.py` 啟動報 `FileNotFoundError: ... 'streamlit'` | `run_all.py` 沒有用 `sys.executable -m streamlit` 啟動 Streamlit，改用系統 PATH 找不到指令；換成最新版 `run_all.py`，若仍報錯代表虛擬環境本身沒裝 streamlit |
+| `opcua_tags` / `modbus_scada` / `tia_scada` 有更新，但 `sensor_readings` 沒有資料 | 確認三個採集器（`run_modbus_collector.py`、`run_s7_collector.py`、`opcua_subscription_service.py`）都有 import `data_layer.timeseries_writer.sensor_reading_writer` 並呼叫 `stage()` + `flush()`；也要確認點位有在對應分頁綁定 `sensor_id`，沒綁定的點位不會寫進時序表 |
+| 重啟服務後，`sensor_readings` 短時間內灌入大量心跳資料 | 確認 `main.py`／各採集器的 `__main__` 有呼叫 `sensor_reading_writer.load_initial_cache()`；沒有呼叫的話，心跳判斷會從程式啟動當下重新算，容易誤判「該補心跳了」 |

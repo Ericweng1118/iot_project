@@ -19,10 +19,24 @@ TimescaleDB 的 sensor_readings（時序表）。
       跟現有 batch_updater.py 的風格一致）。
     - sensor_readings.value 是 NUMERIC，非數值（例如 modbus 的中文狀態字）
       會被直接跳過並記一筆 debug log，不會讓程式崩潰。
+
+🔧 併發安全性補充（多協議併發 + OPC UA 常駐訂閱服務後追加）：
+    這支模組原本假設單執行緒依序呼叫，但現在會有多個呼叫來源同時存在：
+    - Modbus / TIA 各自的多執行緒併發採集（ThreadPoolExecutor）
+    - OPC UA 訂閱服務的獨立背景執行緒（透過 asyncio.to_thread 呼叫）
+    多條執行緒可能同時呼叫 stage() / flush()，_pending 和 _last_values
+    沒有保護會有資料競爭風險，因此加上 threading.Lock 保護關鍵區段。
+
+🔧 Log 等級補充：
+    原本 stage()/flush() 內建的逐筆 INFO 級偵錯 log（含 writer_id 等）
+    是用來驗證單例行為與除錯用的，現在要接上多個採集器、每個點位每輪都會
+    呼叫，數量很大，維持 INFO 會洗版，改為 DEBUG；只保留 flush 完成時的
+    摘要訊息在 INFO 等級，方便正常運作時仍能看到「寫了幾筆」。
 """
 
 import logging
 import os
+import threading
 from datetime import datetime, timedelta
 
 from psycopg2.extras import execute_values
@@ -46,6 +60,9 @@ class SensorReadingWriter:
         self._pending = []
         self._cache_loaded = False
 
+        # 🔒 保護 _pending / _last_values，避免多執行緒併發呼叫 stage()/flush() 時資料競爭
+        self._lock = threading.Lock()
+
     # ------------------------------------------------------------
     # 啟動時載入每個 sensor 目前資料庫裡最新一筆數值
     # ------------------------------------------------------------
@@ -60,12 +77,13 @@ class SensorReadingWriter:
                 with conn.cursor() as cur:
                     cur.execute(query)
                     rows = cur.fetchall()
-                    for sensor_id, value, reading_time in rows:
-                        self._last_values[sensor_id] = (
-                            float(value),
-                            reading_time,
-                        )
-            self._cache_loaded = True
+                    with self._lock:
+                        for sensor_id, value, reading_time in rows:
+                            self._last_values[sensor_id] = (
+                                float(value),
+                                reading_time,
+                            )
+                        self._cache_loaded = True
             logger.info(
                 f"📥 SensorReadingWriter 快取初始化完成，"
                 f"共載入 {len(self._last_values)} 個 sensor 的最新值。"
@@ -84,55 +102,54 @@ class SensorReadingWriter:
         try:
             num_value = float(value)
         except (TypeError, ValueError):
-            logger.info(
+            logger.debug(
                 f"⚠️ sensor_id={sensor_id} 的值 '{value}' (type={type(value).__name__}) "
                 "無法轉成數字，sensor_readings 僅支援數字，已略過。"
             )
             return
 
         now = reading_time or datetime.now().astimezone()
-        last = self._last_values.get(sensor_id)
 
-        should_write = False
-        reason = ""
-        if last is None:
-            should_write = True
-            reason = "首次出現"
-        else:
-            last_value, last_time = last
-            if num_value != last_value:
+        with self._lock:
+            last = self._last_values.get(sensor_id)
+
+            should_write = False
+            reason = ""
+            if last is None:
                 should_write = True
-                reason = f"數值變化 {last_value} -> {num_value}"
-            elif now - last_time > self.heartbeat_interval:
-                should_write = True
-                reason = "心跳補寫"
+                reason = "首次出現"
             else:
-                reason = f"數值未變化且未到心跳時間（距上次 {now - last_time}）"
+                last_value, last_time = last
+                if num_value != last_value:
+                    should_write = True
+                    reason = f"數值變化 {last_value} -> {num_value}"
+                elif now - last_time > self.heartbeat_interval:
+                    should_write = True
+                    reason = "心跳補寫"
+                else:
+                    reason = f"數值未變化且未到心跳時間（距上次 {now - last_time}）"
 
-        logger.info(
-            f"🧾 stage 判斷: sensor_id={sensor_id}, value={num_value}, "
-            f"要寫入={should_write}（{reason}），writer_id={id(self)}"
-        )
-
-        if should_write:
-            self._pending.append((sensor_id, now, num_value))
-            self._last_values[sensor_id] = (num_value, now)
-            logger.info(
-                f"📦 已放入緩衝區，目前緩衝區筆數={len(self._pending)}, writer_id={id(self)}"
+            logger.debug(
+                f"🧾 stage 判斷: sensor_id={sensor_id}, value={num_value}, "
+                f"要寫入={should_write}（{reason}），writer_id={id(self)}"
             )
+
+            if should_write:
+                self._pending.append((sensor_id, now, num_value))
+                self._last_values[sensor_id] = (num_value, now)
+                logger.debug(
+                    f"📦 已放入緩衝區，目前緩衝區筆數={len(self._pending)}, writer_id={id(self)}"
+                )
 
     # ------------------------------------------------------------
     # 把緩衝區的資料批次寫進資料庫
     # ------------------------------------------------------------
     def flush(self):
-        logger.info(
-            f"🚿 flush() 被呼叫，目前緩衝區筆數={len(self._pending)}, writer_id={id(self)}"
-        )
-        if not self._pending:
-            return 0
-
-        rows = self._pending
-        self._pending = []
+        with self._lock:
+            if not self._pending:
+                return 0
+            rows = self._pending
+            self._pending = []
 
         query = """
             INSERT INTO sensor_readings (sensor_id, reading_time, value)
@@ -151,7 +168,8 @@ class SensorReadingWriter:
         except Exception as e:
             logger.error(f"寫入 sensor_readings 失敗: {e}")
             # 失敗的話塞回緩衝區開頭，下一輪再試一次，避免資料遺失
-            self._pending = rows + self._pending
+            with self._lock:
+                self._pending = rows + self._pending
             return 0
 
 

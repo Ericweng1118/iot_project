@@ -1086,8 +1086,7 @@ with tab_opcua:
                         conn.commit()
                 st.success(
                     "✅ OPC UA Server 參數更新成功！"
-                    "⚠️ 連線參數（IP/Port/帳密/安全性原則）的變更需重啟 main.py 才會套用；"
-                    "若只是想重新整理點位表，請改用下方「立即瀏覽並寫入資料庫」。"
+                    "訂閱服務會在 15 秒內自動偵測到連線參數變更並重新連線套用，不需要重啟 main.py。"
                 )
                 st.rerun()
             except Exception as e:
@@ -1187,7 +1186,7 @@ with tab_opcua:
                         conn.commit()
                 st.success(
                     f"🎉 成功新增 OPC UA Server: {o_server_name}\n\n"
-                    "⚠️ 新的 Server 需要重新啟動 main.py 後，訂閱服務才會開始監控。"
+                    "訂閱服務會在 15 秒內自動偵測到這台新 Server 並開始監控，不需要重啟 main.py。"
                 )
                 st.rerun()
             except Exception as e:

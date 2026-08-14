@@ -15,7 +15,7 @@ def main():
 
     print("🚀 [2/2] 正在啟動 Streamlit 管理後台 (admin_app.py)...")
     # 啟動 streamlit 服務
-    streamlit_process = subprocess.Popen(["streamlit", "run", "admin_app.py","--server.port",str(port),])
+    streamlit_process = subprocess.Popen([sys.executable, "-m","streamlit", "run", "admin_app.py","--server.port",str(port),])
 
     print("\n✅ 所有服務已在背景啟動！")
     print("💡 按下 Ctrl + C 可同時安全關閉所有服務。\n")
