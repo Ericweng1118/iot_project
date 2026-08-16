@@ -9,14 +9,32 @@ OPC UA 協議封裝層。
 3. 讀取每個 Variable 節點的目前值、資料型態與品質狀態
 
 使用 asyncua 函式庫（pip install asyncua）
+
+🆕 連線逾時可調整：
+    網路品質不穩定的場域（例如高壓變電室這類訊號常常不太乾淨的環境），
+    預設 10 秒的請求逾時容易把「只是回應比較慢」誤判成「斷線」，
+    造成頻繁的斷線重連與 asyncua 內部的重試 log 洗版。
+    現在可以透過 .env 的 OPCUA_CLIENT_TIMEOUT（秒）全域調整，
+    或在單一 Server 的設定裡加上 client_timeout 欄位個別覆寫（目前
+    opcua_servers 表尚未有這個欄位，若未來要開放網頁調整，需另外
+    補一個 migration 新增該欄位；程式已經預留好讀取邏輯）。
 """
 
 import logging
+import os
 from typing import Optional
 
 from asyncua import Client, ua
 
 logger = logging.getLogger("opcua_protocol")
+
+
+def _get_default_client_timeout() -> float:
+    raw = os.getenv("OPCUA_CLIENT_TIMEOUT", "10").split("#")[0].strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return 10.0
 
 
 class OPCUAConnectionError(Exception):
@@ -29,10 +47,13 @@ async def connect_client(server: dict) -> Client:
     依 opcua_servers 資料表的一筆設定建立連線。
 
     server 需包含：ip, port, username(可選), password(可選),
-                   security_policy(可選), security_mode(可選)
+                   security_policy(可選), security_mode(可選),
+                   client_timeout(可選，秒，個別 Server 覆寫用；沒設定則用
+                   .env 的 OPCUA_CLIENT_TIMEOUT，預設 10 秒)
     """
     url = f"opc.tcp://{server['ip']}:{server['port']}"
-    client = Client(url=url, timeout=10)
+    timeout = server.get("client_timeout") or _get_default_client_timeout()
+    client = Client(url=url, timeout=timeout)
 
     # 帳號密碼（匿名連線則不設定）
     if server.get("username"):

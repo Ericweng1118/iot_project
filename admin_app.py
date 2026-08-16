@@ -15,6 +15,17 @@ load_dotenv()
 ADMIN_USER = os.getenv("ADMIN_USER", "USER")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "PASSWORD")
 
+
+def _env_bool(key: str, default: bool = True) -> bool:
+    """讀取 .env 布林開關（與 main.py 一致的容錯解析：忽略大小寫、尾端 # 註解）"""
+    raw = os.getenv(key, str(default)).split("#")[0].strip().lower()
+    return raw not in ("false", "0", "no", "off")
+
+
+# 🆕 協議啟用開關：停用的協議在網頁後台會完全隱藏對應分頁（含新增/編輯功能）
+MODBUS_ENABLED = _env_bool("MODBUS_ENABLED", True)
+TIA_ENABLED = _env_bool("TIA_ENABLED", True)
+
 from data_layer.db_connector import DatabaseConnector
 from data_layer.batch_updater import batch_update_opcua_tags
 
@@ -447,6 +458,11 @@ with st.sidebar:
     if st.button("🚪 登出系統", use_container_width=True):
         st.session_state["logged_in"] = False
         st.rerun()
+    disabled_protocols = [
+        name for name, on in (("Modbus", MODBUS_ENABLED), ("TIA/S7", TIA_ENABLED)) if not on
+    ]
+    if disabled_protocols:
+        st.info("🔕 已由 .env 停用：" + "、".join(disabled_protocols))
 
 st.title("⚙️ IIoT 點位與連線參數管理後台")
 
@@ -454,21 +470,35 @@ if not hasattr(st, "db_inited"):
     DatabaseConnector.initialize_pool()
     st.db_inited = True
 
-tab_modbus, tab_tia, tab_opcua, tab_hierarchy, tab_alerts = st.tabs(
-    [
-        "📡 Modbus 點位設定",
-        "📡 TIA (S7) 點位設定",
-        "📡 OPC UA 點位設定",
-        "🧬 感測器階層管理",
-        "🚨 異常監控",
-    ]
-)
+_tab_labels = []
+if MODBUS_ENABLED:
+    _tab_labels.append("📡 Modbus 點位設定")
+if TIA_ENABLED:
+    _tab_labels.append("📡 TIA (S7) 點位設定")
+_tab_labels += ["📡 OPC UA 點位設定", "🧬 感測器階層管理", "🚨 異常監控"]
+
+_tabs = st.tabs(_tab_labels)
+_idx = 0
+tab_modbus = None
+tab_tia = None
+if MODBUS_ENABLED:
+    tab_modbus = _tabs[_idx]
+    _idx += 1
+if TIA_ENABLED:
+    tab_tia = _tabs[_idx]
+    _idx += 1
+tab_opcua = _tabs[_idx]
+_idx += 1
+tab_hierarchy = _tabs[_idx]
+_idx += 1
+tab_alerts = _tabs[_idx]
+_idx += 1
 
 
 # ==========================================
 # Tab 1: Modbus 點位 CRUD
 # ==========================================
-with tab_modbus:
+def _render_modbus_tab():
     st.header("Modbus TCP 點位配置")
 
     def load_modbus_tags():
@@ -770,10 +800,15 @@ with tab_modbus:
                 st.error(f"❌ 新增失敗: {e}")
 
 
+if MODBUS_ENABLED and tab_modbus is not None:
+    with tab_modbus:
+        _render_modbus_tab()
+
+
 # ==========================================
 # Tab 2: TIA (S7) 點位 CRUD
 # ==========================================
-with tab_tia:
+def _render_tia_tab():
     st.header("Siemens TIA S7 點位配置")
 
     def load_tia_tags():
@@ -966,6 +1001,11 @@ with tab_tia:
                     st.rerun()
             except Exception as e:
                 st.error(f"❌ 新增失敗: {e}")
+
+
+if TIA_ENABLED and tab_tia is not None:
+    with tab_tia:
+        _render_tia_tab()
 
 
 # ==========================================
@@ -1277,6 +1317,12 @@ with tab_opcua:
     # ----------------------------------------------------------
     st.divider()
     st.subheader("📊 已採集的 OPC UA 點位資料")
+    st.caption(
+        "🆕 訂閱服務只會對「已綁定感測器」的點位持續訂閱更新數值，節省頻寬。"
+        "尚未綁定的點位下面仍看得到（供你挑選要綁哪一個），但 current_data 只會停留在"
+        "上次瀏覽當下的快照，不會即時變動；綁定後最慢 5 秒內會自動開始持續更新，"
+        "或按上方「🚀 立即瀏覽並寫入資料庫」可以手動重新抓一次最新快照。"
+    )
 
     if not df_opcua_servers.empty:
         filter_options = ["全部 Server"] + [
@@ -1554,7 +1600,10 @@ with tab_hierarchy:
     df_sensors_full = _fetch_df(
         """
         SELECT se.sensor_id, d.device_code, se.sensor_code, se.nickname, se.sensor_type,
-               se.unit, se.min_threshold, se.max_threshold, se.state_dictionary, se.device_id
+               se.unit, se.min_threshold, se.max_threshold, se.state_dictionary,
+               se.opcua_sampling_interval_ms, se.opcua_deadband_type, se.opcua_deadband_value,
+               se.upload_condition, se.upload_threshold,
+               se.device_id
         FROM sensors se
         LEFT JOIN devices d ON se.device_id = d.device_id
         ORDER BY se.sensor_id ASC;
@@ -1570,6 +1619,22 @@ with tab_hierarchy:
         "「state_dictionary」是選填的狀態字典（JSON 格式，例如 {\"1\": \"待機\", \"2\": \"運轉\"}），"
         "設定後查詢 sensor_readings_translated 這個 view 就會自動把數字翻譯成文字。"
     )
+    st.caption(
+        "🆕 「OPC UA 取樣頻率(ms)」留空代表沿用 Server 層級預設頻率；"
+        "「上傳條件」決定 sensor_readings 統一週期性寫入時，這個感測器要不要真的被寫入，四選一："
+        "always=不判斷、每輪都寫｜on_change=數值有變化就寫｜"
+        "threshold_percent=變化百分比達到「上傳門檻」才寫（門檻填百分比數字，例如 1 代表 1%，"
+        "以上次實際寫入的值為基準）｜threshold_absolute=變化絕對值達到「上傳門檻」才寫。"
+        "全部感測器預設為 threshold_percent、門檻 1%（與上次寫入值相比變化不到 1% 就不寫入）。"
+        "調整後最慢在下一個統一寫入週期（.env 的 SENSOR_READING_FLUSH_INTERVAL）內生效，不需要重啟服務。"
+    )
+    st.caption(
+        "🆕 「OPC UA Deadband」是另一層、更早的過濾：伺服器端就決定要不要把這筆變化透過網路送過來，"
+        "跟上面的「上傳條件」（決定收到之後要不要寫進資料庫）是不同階段。三選一："
+        "none=不設定、伺服器只要有變化就送｜percent=變化百分比達到「Deadband 門檻」才送"
+        "（⚠️ 依節點是否有設定 EURange 而定，不確定設備有沒有配置時建議用 absolute）｜"
+        "absolute=變化絕對值達到「Deadband 門檻」才送。適合網路連線不穩、想直接減少流量的場域。"
+    )
     if not df_sensors_full.empty:
         df_sensors_full["state_dictionary"] = df_sensors_full["state_dictionary"].apply(
             lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, dict) else v
@@ -1579,6 +1644,8 @@ with tab_hierarchy:
             df_sensors_full[[
                 "sensor_id", "device_code", "sensor_code", "nickname", "sensor_type",
                 "unit", "min_threshold", "max_threshold", "state_dictionary",
+                "opcua_sampling_interval_ms", "opcua_deadband_type", "opcua_deadband_value",
+                "upload_condition", "upload_threshold",
             ]],
             num_rows="fixed",
             key="sensors_editor",
@@ -1588,7 +1655,36 @@ with tab_hierarchy:
                 "state_dictionary": st.column_config.TextColumn(
                     "state_dictionary（選填，JSON 格式）",
                     help='例如：{"1": "待機", "2": "運轉"}',
-                )
+                ),
+                "opcua_sampling_interval_ms": st.column_config.NumberColumn(
+                    "OPC UA 取樣頻率(ms)",
+                    help="留空 = 沿用 Server 層級預設訂閱頻率。相同頻率的點位會被歸進同一組訂閱。"
+                    "⚠️ 有些設備的 OPC UA Server 內部有自己固定的更新周期，會忽略/覆寫這個請求值"
+                    "（連線 log 出現 'RevisedPublishingInterval' 就是這種情況），此時這個設定對該設備無效。",
+                    min_value=50,
+                    step=50,
+                ),
+                "opcua_deadband_type": st.column_config.SelectboxColumn(
+                    "OPC UA Deadband (伺服器端過濾)",
+                    options=["none", "percent", "absolute"],
+                    help="none=不設定｜percent=變化百分比達門檻才送（需節點有 EURange，不確定就用 absolute）｜"
+                    "absolute=變化絕對值達門檻才送。這是在伺服器端就過濾，直接減少網路流量。",
+                ),
+                "opcua_deadband_value": st.column_config.NumberColumn(
+                    "Deadband 門檻",
+                    help="opcua_deadband_type=percent 時填百分比數字；=absolute 時填絕對值；=none 時不生效。",
+                ),
+                "upload_condition": st.column_config.SelectboxColumn(
+                    "上傳條件 (upload_condition)",
+                    options=["always", "on_change", "threshold_percent", "threshold_absolute"],
+                    help="always=不判斷每輪都寫｜on_change=數值變化就寫｜"
+                    "threshold_percent=變化百分比達門檻才寫｜threshold_absolute=變化絕對值達門檻才寫",
+                ),
+                "upload_threshold": st.column_config.NumberColumn(
+                    "上傳門檻",
+                    help="threshold_percent 時填百分比數字（例如 1 = 1%）；"
+                    "threshold_absolute 時填絕對值；always / on_change 時不生效。",
+                ),
             },
         )
 
@@ -1607,11 +1703,24 @@ with tab_hierarchy:
                                 )
                                 continue
 
+                            upload_condition = row.get("upload_condition") or "threshold_percent"
+                            if upload_condition not in (
+                                "always", "on_change", "threshold_percent", "threshold_absolute"
+                            ):
+                                upload_condition = "threshold_percent"
+
+                            deadband_type = row.get("opcua_deadband_type") or "none"
+                            if deadband_type not in ("none", "percent", "absolute"):
+                                deadband_type = "none"
+
                             cur.execute(
                                 """
                                 UPDATE sensors SET
                                     nickname=%s, sensor_type=%s, unit=%s,
-                                    min_threshold=%s, max_threshold=%s, state_dictionary=%s
+                                    min_threshold=%s, max_threshold=%s, state_dictionary=%s,
+                                    opcua_sampling_interval_ms=%s,
+                                    opcua_deadband_type=%s, opcua_deadband_value=%s,
+                                    upload_condition=%s, upload_threshold=%s
                                 WHERE sensor_id=%s;
                                 """,
                                 (
@@ -1623,6 +1732,17 @@ with tab_hierarchy:
                                     float(row["min_threshold"]) if pd.notnull(row["min_threshold"]) else None,
                                     float(row["max_threshold"]) if pd.notnull(row["max_threshold"]) else None,
                                     state_dict_val,
+                                    int(row["opcua_sampling_interval_ms"])
+                                    if pd.notnull(row["opcua_sampling_interval_ms"])
+                                    else None,
+                                    deadband_type,
+                                    float(row["opcua_deadband_value"])
+                                    if pd.notnull(row["opcua_deadband_value"])
+                                    else None,
+                                    upload_condition,
+                                    float(row["upload_threshold"])
+                                    if pd.notnull(row["upload_threshold"])
+                                    else None,
                                     int(row["sensor_id"]),
                                 ),
                             )
@@ -1699,6 +1819,50 @@ with tab_hierarchy:
                 value="",
                 placeholder='{"1": "待機", "2": "運轉"}',
             )
+
+        st.markdown("**🆕 OPC UA 訂閱頻率與統一寫入條件**")
+        col4, col5, col6 = st.columns(3)
+        with col4:
+            new_sensor_use_custom_interval = st.checkbox(
+                "使用自訂 OPC UA 取樣頻率", value=False
+            )
+            new_sensor_sampling_interval = st.number_input(
+                "取樣頻率 (ms)", value=1000, min_value=50, step=50,
+                help="留空（不勾選左方選項）代表沿用 Server 層級預設頻率。",
+            )
+        with col5:
+            new_sensor_upload_condition = st.selectbox(
+                "上傳條件 (upload_condition)",
+                ["threshold_percent", "threshold_absolute", "on_change", "always"],
+                help="threshold_percent=變化百分比達門檻才寫（預設，1% 起跳）｜"
+                "threshold_absolute=變化絕對值達門檻才寫｜on_change=數值變化就寫｜"
+                "always=不判斷，每輪都寫",
+            )
+        with col6:
+            new_sensor_upload_threshold = st.number_input(
+                "上傳門檻",
+                value=1.0,
+                help="threshold_percent 時填百分比數字（例如 1 = 1%）；"
+                "threshold_absolute 時填絕對值；其餘條件下不生效。",
+            )
+
+        st.markdown("**🆕 OPC UA Deadband（伺服器端過濾，減少網路流量）**")
+        col7, col8 = st.columns(2)
+        with col7:
+            new_sensor_deadband_type = st.selectbox(
+                "Deadband 類型 (opcua_deadband_type)",
+                ["none", "percent", "absolute"],
+                help="none=不設定（預設，伺服器只要有變化就送）｜"
+                "percent=變化百分比達門檻才送（需節點有 EURange，不確定就用 absolute）｜"
+                "absolute=變化絕對值達門檻才送。",
+            )
+        with col8:
+            new_sensor_deadband_value = st.number_input(
+                "Deadband 門檻",
+                value=0.0,
+                help="opcua_deadband_type=percent 時填百分比數字；=absolute 時填絕對值；=none 時不生效。",
+            )
+
         if st.form_submit_button("➕ 新增感測器", type="primary"):
             final_sensor_type = (
                 new_sensor_type_custom.strip()
@@ -1731,8 +1895,11 @@ with tab_hierarchy:
                                 """
                                 INSERT INTO sensors
                                     (device_id, sensor_code, nickname, sensor_type, unit,
-                                     min_threshold, max_threshold, state_dictionary)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                                     min_threshold, max_threshold, state_dictionary,
+                                     opcua_sampling_interval_ms,
+                                     opcua_deadband_type, opcua_deadband_value,
+                                     upload_condition, upload_threshold)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                                 """,
                                 (
                                     device_options[new_sensor_device],
@@ -1743,6 +1910,18 @@ with tab_hierarchy:
                                     new_sensor_min,
                                     new_sensor_max,
                                     formatted_state_dict,
+                                    int(new_sensor_sampling_interval)
+                                    if new_sensor_use_custom_interval
+                                    else None,
+                                    new_sensor_deadband_type,
+                                    new_sensor_deadband_value
+                                    if new_sensor_deadband_type in ("percent", "absolute")
+                                    else None,
+                                    new_sensor_upload_condition,
+                                    new_sensor_upload_threshold
+                                    if new_sensor_upload_condition
+                                    in ("threshold_percent", "threshold_absolute")
+                                    else None,
                                 ),
                             )
                             conn.commit()
@@ -1769,19 +1948,23 @@ with tab_alerts:
     st.subheader("🔌 連線異常（plc_state ≠ ONLINE）")
     st.caption("代表這個點位上一輪採集時 PLC/Server 連不上，或讀取/解析失敗。")
 
-    df_offline = _fetch_df(
-        """
-        SELECT 'Modbus' AS 來源, id, name AS 點位名稱, plc_ip, plc_state, last_update::text AS last_update
-        FROM modbus_scada WHERE plc_state IS DISTINCT FROM 'ONLINE'
-        UNION ALL
-        SELECT 'TIA/S7', id, name, plc_ip, plc_state, last_update::text
-        FROM tia_scada WHERE plc_state IS DISTINCT FROM 'ONLINE'
-        UNION ALL
-        SELECT 'OPC UA', id, node_id, server_name, plc_state, last_update::text
-        FROM opcua_tags WHERE plc_state IS DISTINCT FROM 'ONLINE'
-        ORDER BY 來源, id;
-        """
+    _offline_queries = []
+    if MODBUS_ENABLED:
+        _offline_queries.append(
+            "SELECT 'Modbus' AS 來源, id, name AS 點位名稱, plc_ip, plc_state, last_update::text AS last_update "
+            "FROM modbus_scada WHERE plc_state IS DISTINCT FROM 'ONLINE'"
+        )
+    if TIA_ENABLED:
+        _offline_queries.append(
+            "SELECT 'TIA/S7', id, name, plc_ip, plc_state, last_update::text "
+            "FROM tia_scada WHERE plc_state IS DISTINCT FROM 'ONLINE'"
+        )
+    _offline_queries.append(
+        "SELECT 'OPC UA', id, node_id, server_name, plc_state, last_update::text "
+        "FROM opcua_tags WHERE plc_state IS DISTINCT FROM 'ONLINE'"
     )
+
+    df_offline = _fetch_df(" UNION ALL ".join(_offline_queries) + " ORDER BY 1, 2;")
     if not df_offline.empty:
         st.error(f"⚠️ 目前有 {len(df_offline)} 個點位連線異常")
         st.dataframe(df_offline, width="stretch")
@@ -1839,8 +2022,8 @@ with tab_alerts:
         "判定為「太久沒更新」的時數門檻（小時）", min_value=1, value=2, step=1
     )
     st.caption(
-        "正常情況下，就算數值沒變化，系統也會依心跳週期定期補寫一筆進 sensor_readings。"
-        "如果一個已綁定的感測器超過這個時數都沒有任何新資料，通常代表該點位已經斷線、"
+        "正常情況下，就算數值沒變化，系統也會依統一寫入排程的 upload_condition 規則定期補寫一筆進 "
+        "sensor_readings。如果一個已綁定的感測器超過這個時數都沒有任何新資料，通常代表該點位已經斷線、"
         "或是採集程式沒有正常執行。"
     )
 

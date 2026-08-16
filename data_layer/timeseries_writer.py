@@ -1,43 +1,48 @@
 """
 data_layer/timeseries_writer.py
 ================================
-依 README_DB.md 定義的「資料寫入規則」把即時採集到的數值寫進
-TimescaleDB 的 sensor_readings（時序表）。
+把即時採集到的數值寫進 TimescaleDB 的 sensor_readings（時序表）。
 
-規則（對應 README_DB.md）：
-    - 該 sensor_id 第一次出現              -> 寫入
-    - 新值 與 快取中的上一筆數值 不同         -> 寫入
-    - 數值相同，但距離上次寫入超過心跳週期     -> 仍寫入（心跳，證明沒斷線）
-    - 其餘情況（數值相同 且 尚未到心跳時間）   -> 不寫入
+🆕 v2 設計（統一週期性寫入）：
+    v1 版本由各採集器在每輪採集結束時呼叫 stage() + flush()，
+    依「首次出現 / 數值變化 / 心跳補寫」逐點位判斷是否要寫入，
+    寫入時機分散、跟各協議自己的採集週期綁在一起。
 
-設計重點：
-    - 用「記憶體快取」記住每個 sensor_id 的上一筆值/時間，
-      避免每一輪採集都要查一次 DB 才能判斷是否重複（比對邏輯全部在記憶體做）。
-    - 服務啟動時呼叫 load_initial_cache()，把每個 sensor_id 目前資料庫裡
-      最新的一筆讀回來，避免程式重啟後心跳判斷從頭算，导致心跳時間錯亂。
-    - stage() 只是「先放進緩衝區」，真正寫進 DB 要呼叫 flush()（批次 INSERT，
-      跟現有 batch_updater.py 的風格一致）。
-    - sensor_readings.value 是 NUMERIC，非數值（例如 modbus 的中文狀態字）
-      會被直接跳過並記一筆 debug log，不會讓程式崩潰。
+    v2 拆成兩層，彼此獨立：
+      1. 最新值快取（高頻、純記憶體）
+         採集端（OPC UA 訂閱服務為主，Modbus/TIA 若啟用也共用同一套）
+         每次讀到新值就呼叫 update_latest()，只更新記憶體快取，不碰資料庫。
 
-🔧 併發安全性補充（多協議併發 + OPC UA 常駐訂閱服務後追加）：
-    這支模組原本假設單執行緒依序呼叫，但現在會有多個呼叫來源同時存在：
-    - Modbus / TIA 各自的多執行緒併發採集（ThreadPoolExecutor）
-    - OPC UA 訂閱服務的獨立背景執行緒（透過 asyncio.to_thread 呼叫）
-    多條執行緒可能同時呼叫 stage() / flush()，_pending 和 _last_values
-    沒有保護會有資料競爭風險，因此加上 threading.Lock 保護關鍵區段。
+      2. 統一寫入排程（低頻、固定週期，由 .env 控制）
+         背景執行緒依 SENSOR_READING_FLUSH_INTERVAL（秒）固定週期醒來，
+         把「目前所有感測器的最新值」一次性依各自的 sensors.upload_condition
+         判斷後批次寫入 sensor_readings。upload_condition 四選一：
+             - always            : 不判斷，每一輪都寫
+             - on_change         : 只有數值與上次「實際寫入」的值不同才寫
+             - threshold_percent : 變化「百分比」達到 upload_threshold（例如 1 = 1%）才寫，
+                                    以「上次實際寫入的值」為基準；上次值為 0 時無法算百分比，
+                                    退化為「數值不再是 0 就寫」
+             - threshold_absolute: 變化「絕對值」達到 upload_threshold 才寫
 
-🔧 Log 等級補充：
-    原本 stage()/flush() 內建的逐筆 INFO 級偵錯 log（含 writer_id 等）
-    是用來驗證單例行為與除錯用的，現在要接上多個採集器、每個點位每輪都會
-    呼叫，數量很大，維持 INFO 會洗版，改為 DEBUG；只保留 flush 完成時的
-    摘要訊息在 INFO 等級，方便正常運作時仍能看到「寫了幾筆」。
+    也就是「多久寫一次」是全域參數（.env），「這次要不要寫」是逐感測器規則
+    （sensors 表，可在網頁「感測器階層管理」分頁調整：百分比 / 絕對值 / 不判斷，
+    最慢下一輪就生效）。
+
+    stage() / flush() 兩個舊方法仍保留（stage 等同 update_latest 的別名；
+    flush 除了是背景排程內部呼叫的核心方法，也可以被其他程式手動呼叫，
+    立即觸發一次寫入），維持向下相容，既有採集器程式碼不需要修改也能繼續運作。
+
+🔒 併發安全性：
+    Modbus / TIA 各自的多執行緒併發採集、OPC UA 訂閱服務的背景執行緒，
+    都可能同時呼叫 update_latest()，寫入排程的背景執行緒則會定期讀取快照，
+    因此用 threading.Lock 保護 _latest_values / _last_written / _upload_config。
 """
 
 import logging
 import os
 import threading
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 
 from psycopg2.extras import execute_values
 
@@ -46,25 +51,39 @@ from .db_connector import DatabaseConnector
 logger = logging.getLogger(__name__)
 
 
-class SensorReadingWriter:
-    def __init__(self, heartbeat_interval_seconds=None):
-        # 心跳週期：數值沒變化時，最少多久還是要補寫一筆進資料庫
-        raw = heartbeat_interval_seconds or os.getenv(
-            "SENSOR_HEARTBEAT_INTERVAL", "3600"
-        )
-        self.heartbeat_interval = timedelta(seconds=float(raw))
+def _parse_env_float(key: str, default: float) -> float:
+    raw = os.getenv(key, str(default))
+    try:
+        return float(str(raw).split("#")[0].strip())
+    except (TypeError, ValueError):
+        return float(default)
 
-        # sensor_id -> (last_value: float, last_time: datetime)
-        self._last_values = {}
-        # 待寫入緩衝區： [(sensor_id, reading_time, value), ...]
-        self._pending = []
+
+class SensorReadingWriter:
+    def __init__(self, flush_interval_seconds=None):
+        # 統一寫入週期（秒）：來源 .env SENSOR_READING_FLUSH_INTERVAL，預設 60 秒
+        self.flush_interval = (
+            float(flush_interval_seconds)
+            if flush_interval_seconds is not None
+            else _parse_env_float("SENSOR_READING_FLUSH_INTERVAL", 60.0)
+        )
+
+        # sensor_id -> (value: float, time: datetime)　最新收到的值（尚未必然寫入）
+        self._latest_values = {}
+        # sensor_id -> (value: float, time: datetime)　最後一次「實際寫入」DB 的值
+        self._last_written = {}
+        # sensor_id -> (upload_condition: str, upload_threshold: float|None)
+        self._upload_config = {}
+
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
         self._cache_loaded = False
 
-        # 🔒 保護 _pending / _last_values，避免多執行緒併發呼叫 stage()/flush() 時資料競爭
-        self._lock = threading.Lock()
-
     # ------------------------------------------------------------
-    # 啟動時載入每個 sensor 目前資料庫裡最新一筆數值
+    # 啟動時載入每個 sensor 目前資料庫裡最新一筆數值，
+    # 當作 _last_written 的起始狀態（避免程式重啟後 on_change/threshold
+    # 判斷從頭算，誤判「值變了」而重複寫入相同數值）
     # ------------------------------------------------------------
     def load_initial_cache(self):
         query = """
@@ -79,77 +98,98 @@ class SensorReadingWriter:
                     rows = cur.fetchall()
                     with self._lock:
                         for sensor_id, value, reading_time in rows:
-                            self._last_values[sensor_id] = (
-                                float(value),
-                                reading_time,
-                            )
+                            self._last_written[sensor_id] = (float(value), reading_time)
                         self._cache_loaded = True
             logger.info(
                 f"📥 SensorReadingWriter 快取初始化完成，"
-                f"共載入 {len(self._last_values)} 個 sensor 的最新值。"
+                f"共載入 {len(self._last_written)} 個 sensor 的最新值。"
             )
         except Exception as e:
             logger.error(f"載入 sensor_readings 最新值快取失敗: {e}")
 
+        self._refresh_upload_config()
+
     # ------------------------------------------------------------
-    # 判斷是否要寫入，要的話先放進緩衝區（不會立刻打 DB）
+    # 重新讀取 sensors 表的 upload_condition / upload_threshold 設定。
+    # 背景排程每一輪都會呼叫，讓網頁上剛改的設定最慢下一個週期就生效，
+    # 不需要重啟服務。
     # ------------------------------------------------------------
-    def stage(self, sensor_id, value, reading_time=None):
+    def _refresh_upload_config(self):
+        query = """
+            SELECT sensor_id, upload_condition, upload_threshold
+            FROM sensors;
+        """
+        try:
+            with DatabaseConnector.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query)
+                    rows = cur.fetchall()
+            new_config = {}
+            for sensor_id, condition, threshold in rows:
+                new_config[sensor_id] = (
+                    (condition or "always").lower(),
+                    float(threshold) if threshold is not None else None,
+                )
+            with self._lock:
+                self._upload_config = new_config
+        except Exception as e:
+            # 常見原因：尚未執行 sql/006_opcua_upgrade.sql，欄位還不存在。
+            # 不讓整個排程掛掉，退回「全部視為 always」，等 migration 補跑後自動恢復。
+            logger.error(
+                f"重新整理 sensors.upload_condition 設定失敗（尚未執行 "
+                f"sql/006_opcua_upgrade.sql 的話會出現這個錯誤）: {e}"
+            )
+
+    # ------------------------------------------------------------
+    # 更新「最新值」快取：高頻呼叫，僅記憶體操作，沒有任何 DB I/O。
+    # ------------------------------------------------------------
+    def update_latest(self, sensor_id, value, reading_time=None):
         if sensor_id is None:
-            # 這個點位還沒被綁定到 sensors 階層，不寫進時序表
+            # 這個點位還沒被綁定到 sensors 階層，不進時序表
             return
 
         try:
             num_value = float(value)
         except (TypeError, ValueError):
             logger.debug(
-                f"⚠️ sensor_id={sensor_id} 的值 '{value}' (type={type(value).__name__}) "
-                "無法轉成數字，sensor_readings 僅支援數字，已略過。"
+                f"⚠️ sensor_id={sensor_id} 的值 '{value}' "
+                f"(type={type(value).__name__}) 無法轉成數字，已略過。"
             )
             return
 
         now = reading_time or datetime.now().astimezone()
-
         with self._lock:
-            last = self._last_values.get(sensor_id)
+            self._latest_values[sensor_id] = (num_value, now)
 
-            should_write = False
-            reason = ""
-            if last is None:
-                should_write = True
-                reason = "首次出現"
-            else:
-                last_value, last_time = last
-                if num_value != last_value:
-                    should_write = True
-                    reason = f"數值變化 {last_value} -> {num_value}"
-                elif now - last_time > self.heartbeat_interval:
-                    should_write = True
-                    reason = "心跳補寫"
-                else:
-                    reason = f"數值未變化且未到心跳時間（距上次 {now - last_time}）"
-
-            logger.debug(
-                f"🧾 stage 判斷: sensor_id={sensor_id}, value={num_value}, "
-                f"要寫入={should_write}（{reason}），writer_id={id(self)}"
-            )
-
-            if should_write:
-                self._pending.append((sensor_id, now, num_value))
-                self._last_values[sensor_id] = (num_value, now)
-                logger.debug(
-                    f"📦 已放入緩衝區，目前緩衝區筆數={len(self._pending)}, writer_id={id(self)}"
-                )
+    # 向下相容：v1 的呼叫方式（各採集器既有程式碼）繼續可用
+    def stage(self, sensor_id, value, reading_time=None):
+        self.update_latest(sensor_id, value, reading_time)
 
     # ------------------------------------------------------------
-    # 把緩衝區的資料批次寫進資料庫
+    # 執行一次「統一週期性寫入」：檢查目前所有有最新值的 sensor，
+    # 依各自 upload_condition 決定要不要寫，批次 INSERT。
+    # 可被背景排程自動呼叫，也可以手動呼叫立即觸發一次寫入。
     # ------------------------------------------------------------
     def flush(self):
         with self._lock:
-            if not self._pending:
-                return 0
-            rows = self._pending
-            self._pending = []
+            snapshot = dict(self._latest_values)
+            upload_config = dict(self._upload_config)
+            last_written = dict(self._last_written)
+
+        rows_to_write = []
+        for sensor_id, (value, ts) in snapshot.items():
+            condition, threshold = upload_config.get(sensor_id, ("always", None))
+            last = last_written.get(sensor_id)
+            write_it, reason = self._should_write_with(condition, threshold, last, value)
+            logger.debug(
+                f"🧾 統一寫入判斷: sensor_id={sensor_id}, value={value}, "
+                f"要寫入={write_it}（{reason}）"
+            )
+            if write_it:
+                rows_to_write.append((sensor_id, ts, value))
+
+        if not rows_to_write:
+            return 0
 
         query = """
             INSERT INTO sensor_readings (sensor_id, reading_time, value)
@@ -159,21 +199,118 @@ class SensorReadingWriter:
         try:
             with DatabaseConnector.get_connection() as conn:
                 with conn.cursor() as cur:
-                    execute_values(cur, query, rows)
-            logger.info(
-                f"💾 SensorReadingWriter 成功寫入 {len(rows)} "
-                "筆時序資料到 sensor_readings。"
-            )
-            return len(rows)
-        except Exception as e:
-            logger.error(f"寫入 sensor_readings 失敗: {e}")
-            # 失敗的話塞回緩衝區開頭，下一輪再試一次，避免資料遺失
+                    execute_values(cur, query, rows_to_write)
             with self._lock:
-                self._pending = rows + self._pending
+                for sensor_id, ts, value in rows_to_write:
+                    self._last_written[sensor_id] = (value, ts)
+            logger.info(
+                f"💾 [統一寫入] 本輪共 {len(snapshot)} 個感測器有最新值，"
+                f"依 upload_condition 判斷後寫入 {len(rows_to_write)} 筆到 sensor_readings。"
+            )
+            return len(rows_to_write)
+        except Exception as e:
+            logger.error(f"統一寫入 sensor_readings 失敗: {e}")
             return 0
 
+    @staticmethod
+    def _should_write_with(condition, threshold, last, value):
+        """
+        判斷這個 sensor 這一輪要不要寫。condition 四選一：
+            always            - 不判斷，每輪都寫
+            on_change         - 數值與上次「實際寫入」的值不同才寫
+            threshold_percent - 變化百分比（以上次寫入值為基準）達到 threshold 才寫，
+                                 threshold 以「百分比數字」表示（例如 1 代表 1%）
+            threshold_absolute- 變化絕對值達到 threshold 才寫
+        """
+        if last is None:
+            return True, "首次出現"
+        if condition == "always":
+            return True, "always（不判斷）"
 
-# 跨模組共用的單例：main.py 與各 collector 都 import 這個同一個實例，
-# 這樣同一輪採集（S7 + Modbus + OPC UA）的資料最後可以一起 flush，
-# 也可以各自獨立 flush（單獨執行某個 collector 腳本時仍然正常運作）。
+        last_value, _ = last
+
+        if condition == "on_change":
+            if value != last_value:
+                return True, f"數值變化 {last_value} -> {value}"
+            return False, "數值未變化"
+
+        if condition == "threshold_absolute":
+            th = threshold if threshold is not None else 0.0
+            delta = abs(value - last_value)
+            if delta >= th:
+                return True, f"變化絕對值 {delta} >= 門檻 {th}"
+            return False, f"變化絕對值 {delta} < 門檻 {th}"
+
+        if condition == "threshold_percent":
+            th = threshold if threshold is not None else 1.0  # 預設 1%
+            if last_value == 0:
+                # 上次寫入值為 0，百分比無法定義：只要新值不再是 0 就視為顯著變化
+                if value != 0:
+                    return True, "上次寫入值為 0，數值不再是 0，視為顯著變化"
+                return False, "上次寫入值為 0，數值仍為 0"
+            delta_pct = abs(value - last_value) / abs(last_value) * 100.0
+            if delta_pct >= th:
+                return True, f"變化百分比 {delta_pct:.4f}% >= 門檻 {th}%"
+            return False, f"變化百分比 {delta_pct:.4f}% < 門檻 {th}%"
+
+        # 相容舊版遺留的 'threshold'（v2 初版曾用過，語意為絕對值）
+        if condition == "threshold":
+            th = threshold if threshold is not None else 0.0
+            delta = abs(value - last_value)
+            if delta >= th:
+                return True, f"[相容舊設定] 變化絕對值 {delta} >= 門檻 {th}"
+            return False, f"[相容舊設定] 變化絕對值 {delta} < 門檻 {th}"
+
+        return True, f"未知 upload_condition='{condition}'，安全預設寫入"
+
+    # ------------------------------------------------------------
+    # 背景執行緒：固定週期呼叫 flush()
+    # ------------------------------------------------------------
+    def _loop(self):
+        logger.info(
+            f"🕒 SensorReadingWriter 統一寫入排程已啟動，週期 = {self.flush_interval} 秒"
+        )
+        while not self._stop_event.is_set():
+            # 每一輪先重新整理 upload_condition 設定，
+            # 讓網頁上剛改的設定最慢下一輪就生效，不需要重啟服務
+            self._refresh_upload_config()
+            try:
+                self.flush()
+            except Exception as e:
+                logger.error(f"統一寫入排程執行例外: {e}", exc_info=True)
+
+            waited = 0.0
+            step = 0.5
+            while waited < self.flush_interval and not self._stop_event.is_set():
+                time.sleep(min(step, self.flush_interval - waited))
+                waited += step
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        if not self._cache_loaded:
+            self.load_initial_cache()
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._loop, name="sensor-reading-writer", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self, timeout=10):
+        if not self._thread:
+            return
+        self._stop_event.set()
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            logger.warning("⚠️ SensorReadingWriter 執行緒未能在時限內結束。")
+        # 停止前，把目前累積的最新值再寫一次，避免漏掉最後一小段資料
+        try:
+            self.flush()
+        except Exception:
+            pass
+        logger.info("👋 SensorReadingWriter 統一寫入排程已停止。")
+
+
+# 跨模組共用的單例：main.py 與各 collector / OPC UA 訂閱服務都 import 這個
+# 同一個實例，所有協議的最新值最終由同一個背景排程統一寫入。
 sensor_reading_writer = SensorReadingWriter()
