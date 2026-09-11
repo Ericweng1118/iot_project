@@ -40,7 +40,11 @@ import threading
 import time
 
 from data_layer.db_connector import DatabaseConnector
-from data_layer.batch_updater import batch_update_opcua_tags, batch_update_opcua_values
+from data_layer.batch_updater import (
+    batch_update_opcua_tags,
+    batch_update_opcua_values,
+    set_opcua_bound_tags_state,
+)
 from data_layer.timeseries_writer import sensor_reading_writer
 from protocols.opcua_protocol import connect_client, browse_recursive, OPCUAConnectionError
 from collector.run_opcua_collector import load_opcua_servers, update_server_status
@@ -641,6 +645,12 @@ async def _run_server_subscription(server: dict, stop_event: asyncio.Event):
                 f"共監控 {len(handle_map)} 個點位（{len(subscriptions)} 組取樣頻率）"
             )
 
+            # 🔧 訂閱建立成功 = 這些點位重新回到「有在監控」的狀態，明確標回 ONLINE。
+            # 不能只依賴 _flush_to_db（它只會更新「這一輪有收到變化」的點位）：
+            # 斷線重連後若數值剛好都沒變，點位會一直停在 OFFLINE 造成假警報。
+            if subscribable_tags:
+                await asyncio.to_thread(set_opcua_bound_tags_state, server_id, "ONLINE")
+
             flush_task = asyncio.create_task(
                 _flush_loop(buffer, server_id, server_name, state, stop_event)
             )
@@ -683,6 +693,12 @@ async def _run_server_subscription(server: dict, stop_event: asyncio.Event):
             error_str = str(e)
             logger.error(f"❌ [訂閱服務] Server [{server_name}] 連線/訂閱發生例外: {e}")
             await asyncio.to_thread(update_server_status, server_id, "OFFLINE", error_str)
+            # 🔧 同步把「已綁定」的點位標記為 OFFLINE。
+            # 原本只更新 opcua_servers.conn_state，opcua_tags.plc_state 會永遠
+            # 停在 ONLINE，導致網頁「異常監控」的連線異常永遠偵測不到 OPC UA
+            # 斷線。未綁定的點位不動（它們本來就不會被訂閱更新，標成 OFFLINE
+            # 只會塞爆異常清單）。
+            await asyncio.to_thread(set_opcua_bound_tags_state, server_id, "OFFLINE")
             session_limit_hit = "TooManySessions" in error_str
 
         finally:

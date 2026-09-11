@@ -288,7 +288,7 @@ def main():
         grouped_tags[key].append(tag)
 
     results_to_update = []
-    now = datetime.now()
+    now = datetime.now().astimezone()
 
     # 併發連線多台設備：每台設備各自跑在獨立執行緒，
     # 某一台離線卡在 connect timeout 不會拖到其他台的採集

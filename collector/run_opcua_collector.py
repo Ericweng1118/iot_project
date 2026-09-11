@@ -29,20 +29,37 @@ logger = logging.getLogger(__name__)
 
 
 def load_opcua_servers():
-    """從資料庫撈出所有啟用中的 OPC UA Server 連線設定"""
-    query = """
-        SELECT id, server_name, ip, port, username, password,
-               security_policy, security_mode, root_node_id, browse_depth
-        FROM opcua_servers
-        WHERE enabled = TRUE;
     """
-    try:
+    從資料庫撈出所有啟用中的 OPC UA Server 連線設定。
+
+    publish_interval_ms 是這台 Server 的預設訂閱取樣頻率（毫秒），NULL 代表
+    沿用 .env 的 OPCUA_PUBLISH_INTERVAL_MS。opcua_subscription_service.py 會
+    用它當作該 Server 底下所有點位的預設值，個別點位再由
+    sensors.opcua_sampling_interval_ms 覆寫。
+    """
+    base_cols = """id, server_name, ip, port, username, password,
+                   security_policy, security_mode, root_node_id, browse_depth"""
+
+    def _query(cols):
         with DatabaseConnector.get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(query)
-                cols = [desc[0] for desc in cur.description]
-                rows = cur.fetchall()
-        return [dict(zip(cols, row)) for row in rows]
+                cur.execute(f"SELECT {cols} FROM opcua_servers WHERE enabled = TRUE;")
+                names = [desc[0] for desc in cur.description]
+                return [dict(zip(names, row)) for row in cur.fetchall()]
+
+    try:
+        return _query(base_cols + ", publish_interval_ms")
+    except Exception as e:
+        # 尚未執行 sql/009_opcua_server_publish_interval.sql 時欄位還不存在。
+        # 這裡退回不含該欄位的查詢，讓服務照常運作（取樣頻率一律沿用 .env 的
+        # OPCUA_PUBLISH_INTERVAL_MS），不因為少一個選填欄位就整個停擺。
+        logger.warning(
+            f"讀取 opcua_servers.publish_interval_ms 失敗，改用不含該欄位的查詢"
+            f"（若尚未執行 sql/009_opcua_server_publish_interval.sql 會出現此訊息）: {e}"
+        )
+
+    try:
+        return _query(base_cols)
     except Exception as e:
         logger.error(f"從資料庫讀取 OPC UA Server 清單失敗: {e}")
         return []

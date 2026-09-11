@@ -7,7 +7,7 @@
 **v2 升級重點**：Modbus / TIA(S7) 可透過 `.env` 完全屏蔽（含網頁分頁），系統聚焦
 強化 OPC UA——逐感測器可調訂閱頻率、伺服器端 deadband 過濾、只訂閱已綁定的點位
 （省頻寬）；`sensor_readings` 改為全域統一週期性寫入，配合逐感測器的寫入條件
-（百分比 / 絕對值 / 不判斷）。詳見下方各節與 `UPGRADE_NOTES_v2.md`。
+（百分比 / 絕對值 / 不判斷）。詳見下方各節與 [`UPGRADE_NOTES_v2.md`](UPGRADE_NOTES_v2.md)。
 
 ---
 
@@ -40,8 +40,9 @@ OPC UA 常駐一個獨立的背景服務，跟主迴圈完全脫鉤：
 - **只訂閱已綁定感測器的點位** 🆕：瀏覽發現的所有點位都會存進 `opcua_tags`（供網頁挑選），
   但只有設定了 `sensor_id` 的點位才會實際建立 OPC UA 訂閱，未綁定的點位不佔訂閱資源、
   不消耗頻寬。綁定/解除綁定後最慢 5 秒內自動生效
-- **逐感測器可調訂閱頻率** 🆕：`sensors.opcua_sampling_interval_ms` 可覆寫個別點位的
-  取樣頻率（毫秒）；相同頻率的點位會被自動歸進同一組 Subscription（OPC UA 的
+- **可調訂閱頻率（三層優先序）** 🆕：`sensors.opcua_sampling_interval_ms`（逐感測器）
+  > `opcua_servers.publish_interval_ms`（逐 Server）> `.env` 的 `OPCUA_PUBLISH_INTERVAL_MS`
+  （全域）。相同頻率的點位會被自動歸進同一組 Subscription（OPC UA 的
   publishing interval 是 Subscription 層級屬性），不同頻率各自獨立 Subscription。
   ⚠️ 部分設備（尤其嵌入式協議轉換盒）的 OPC UA Server 有自己固定的內部更新週期，
   會忽略/覆寫用戶端請求的頻率（連線 log 出現 `Revised values returned differ from
@@ -91,12 +92,24 @@ OPC UA 常駐一個獨立的背景服務，跟主迴圈完全脫鉤：
    `sensors.upload_condition` 判斷後批次寫入 `sensor_readings`，四選一：
    - `always`：不判斷，每一輪都寫
    - `on_change`：只有數值與上次「實際寫入」的值不同才寫
-   - `threshold_percent`（**預設**）：變化百分比達到 `upload_threshold` 才寫，
-     以上次實際寫入的值為基準（`upload_threshold` 填百分比數字，例如 `1` = 1%）；
-     上次寫入值為 0 時無法算百分比，退化為「新值不再是 0 就寫」。
-     migration 已把所有感測器預設為 `threshold_percent`、門檻 `1`
+   - `threshold_percent`（**新建感測器的預設值**）：變化百分比達到 `upload_threshold`
+     才寫，以上次實際寫入的值為基準（`upload_threshold` 填百分比數字，例如 `1` = 1%）；
+     上次寫入值為 0 時無法算百分比，退化為「新值不再是 0 就寫」
    - `threshold_absolute`：變化絕對值達到 `upload_threshold` 才寫（適合各感測器量級
      差異大、百分比意義不明確的情境）
+3. **心跳保底**（由 `.env` 的 `SENSOR_HEARTBEAT_INTERVAL` 秒控制，預設 3600）：
+   不論上面判斷結果如何，只要距離上次實際寫入超過這個時間就強制補寫一筆
+
+> ⚠️ **累計型計數器不要用 `threshold_percent`。** 累計電表/流量計的基準值可以到
+> 百萬等級、日增量卻只有幾百，「變化 1%」要累積四十幾天才達得到，結果就是資料看起來
+> 整個斷掉、但採集其實一切正常。這類單調遞增的點位請用 `on_change`（值一跳動就寫，
+> 不需要為每支點位猜門檻）或 `threshold_absolute`（想降低資料量時，門檻用工程單位設定）。
+> 正式庫的 63 個累計型感測器已由 [`sql/010`](sql/010_cumulative_counter_upload_condition.sql)
+> 統一改成 `on_change`，詳見 [`todo.md`](todo.md) 待辦 #2 的事故紀錄。
+
+> 💡 心跳保底存在的理由：沒有它，門檻設得不合理的點位會**完全沒有任何紀錄、也不會有
+> 任何錯誤 log**，只能靠人工發現。有了心跳，「設備沒有新資料」跟「採集系統掛了」
+> 在資料上才能區分開來。除非你有別的斷更偵測機制，否則不建議設成 0（關閉）。
 
 判斷全部在記憶體做，服務啟動時會把每個 sensor 目前資料庫裡最新一筆讀回來當快取；
 `upload_condition` / `upload_threshold` 調整後最慢下一個統一寫入週期內生效，
@@ -152,20 +165,28 @@ MQTT 端採用增量發送：快取上一輪的值，只有數值變化時才發
 │   ├── run_modbus_collector.py
 │   ├── run_s7_collector.py
 │   └── run_opcua_collector.py    # 獨立測試用一次性瀏覽腳本，main.py 平時走訂閱服務
-├── sql/                           # 依序執行 001 ~ 007
-│   ├── 001_sensor_hierarchy_and_mapping.sql
-│   ├── ...
-│   ├── 006_opcua_upgrade.sql     # 🆕 sensors 新增 opcua_sampling_interval_ms / upload_condition / upload_threshold
-│   └── 007_opcua_deadband.sql    # 🆕 sensors 新增 opcua_deadband_type / opcua_deadband_value
+├── sql/                          # DB migration，依序執行 000 → 001 → 006 → 007 → 008 → 009
+│   ├── README.md                 # 各 migration 用途、執行順序、編號斷層說明
+│   ├── 000_realtime_tables.sql   # 即時層四張表（tia_scada / modbus_scada / opcua_servers / opcua_tags）
+│   ├── 001_sensor_hierarchy_and_mapping.sql   # 階層表 + sensor_readings hypertable + sensor_id 欄位
+│   ├── 006_opcua_upgrade.sql     # sensors 新增 opcua_sampling_interval_ms / upload_condition / upload_threshold
+│   ├── 007_opcua_deadband.sql    # sensors 新增 opcua_deadband_type / opcua_deadband_value
+│   ├── 008_missing_app_columns.sql            # 補齊沒有腳本、但程式碼在用的欄位（全新部署必跑）
+│   └── 009_opcua_server_publish_interval.sql  # opcua_servers 新增 publish_interval_ms
 ├── main.py                       # 統一主程式（依 .env 開關決定啟動哪些協議）
 ├── admin_app.py                  # 網頁管理後台（依 .env 開關隱藏對應分頁）
-├── run_all.py
+├── run_all.py                    # 同時啟動 main.py + admin_app.py
 ├── requirements.txt
 ├── Dockerfile
-├── .env                           # 請自行建立，勿提交 Git
-├── UPGRADE_NOTES_v2.md           # 🆕 v2 升級細節、部署步驟、已知取捨
-└── README.md
+├── env.example                   # .env 範本，複製成 .env 後填值（.env 已 gitignore）
+├── 狀態字典範例.json              # state_dictionary 欄位的填寫範例（參考用，程式不讀取）
+├── todo.md                       # 待辦事項與已知技術債
+├── README.md                     # 本檔：功能、架構、操作、排錯
+├── README_DB.md                  # 資料庫 schema 參考（即時層四張表的完整欄位定義）
+└── UPGRADE_NOTES_v2.md           # v1 → v2 的行為變化與已知取捨
 ```
+
+> `sql/` 的編號 002 ~ 005 不存在，不是遺失——那幾版 v1 期間的變更當時是直接在資料庫上手動執行、沒有留下腳本。全新部署依序跑 `000` → `001` → `006` → `007` → `008` → `009` 即可，詳見 [`sql/README.md`](sql/README.md)。
 
 ---
 
@@ -181,68 +202,63 @@ pip install -r requirements.txt
 
 ### 2. 建立 `.env` 環境變數檔案
 
+以 `env.example` 為範本複製一份，再填入實際值：
+
 ```bash
-# ===== 資料庫連線設定 =====
-DB_HOST=192.168.x.x
-DB_PORT=5432
-DB_NAME=your_database
-DB_USER=your_username
-DB_PASSWORD=your_password
-
-# ===== MQTT 伺服器設定 =====
-MQTT_ENABLED=true
-MQTT_BROKER=192.168.x.x
-MQTT_PORT=1883
-MQTT_USER=your_mqtt_user
-MQTT_PASSWORD=your_password
-MQTT_GROUP_ID=scada_unified
-MQTT_TOPIC=iot-2/evt/wadata/fmt/scada_unified
-
-# ===== 🆕 協議啟用開關 =====
-# 預設皆為 true（相容既有部署）；設為 false 完全屏蔽該協議，
-# main.py 不啟動採集執行緒、admin_app.py 隱藏對應分頁
-MODBUS_ENABLED=false
-TIA_ENABLED=false
-OPCUA_ENABLED=true
-
-# ===== 採集服務週期設定 =====
-# 僅套用於 Modbus / TIA(S7)；OPC UA 走常駐訂閱服務，不受此週期影響
-POLL_INTERVAL="60.0"
-
-# ===== 🆕 sensor_readings 統一寫入排程 =====
-# 全部感測器一起檢查、統一批次寫入的固定週期（秒）；
-# 個別感測器實際要不要寫，依 sensors.upload_condition 判斷
-SENSOR_READING_FLUSH_INTERVAL=60
-
-# ===== OPC UA 訂閱設定 =====
-# Server 層級預設訂閱取樣頻率（毫秒），個別感測器可用 sensors.opcua_sampling_interval_ms 覆寫
-OPCUA_PUBLISH_INTERVAL_MS=1000
-
-# ===== 🆕 OPC UA 連線穩定性參數（網路品質不穩的場域可調高） =====
-OPCUA_CLIENT_TIMEOUT=10           # 單次請求逾時秒數
-OPCUA_HEARTBEAT_INTERVAL_SEC=15   # 心跳檢查週期
-OPCUA_HEARTBEAT_TIMEOUT_SEC=8     # 單次心跳讀取逾時秒數
-OPCUA_HEARTBEAT_MAX_FAILURES=2    # 連續失敗幾次才判定斷線、觸發完整重連
-
-# ===== 網頁小工具入口帳號、密碼、PORT =====
-ADMIN_USER=user
-ADMIN_PASSWORD=password
-ADMIN_PORT=PORT_NUMBER
+cp env.example .env
 ```
+
+`env.example` 是**唯一**的環境變數清單來源（已與程式碼實際讀取的 key 對齊），
+以下只列出比較需要留意的幾項：
+
+| 變數 | 預設 | 說明 |
+| --- | --- | --- |
+| `MODBUS_ENABLED` / `TIA_ENABLED` / `OPCUA_ENABLED` | `true` | 設為 `false` 完全屏蔽該協議：`main.py` 不啟動採集執行緒，`admin_app.py` 隱藏對應分頁 |
+| `POLL_INTERVAL` | `60.0` | Modbus / TIA(S7) 的採集週期（秒）。OPC UA 走常駐訂閱服務，**不受此值影響** |
+| `SENSOR_READING_FLUSH_INTERVAL` | `60` | `sensor_readings` 統一批次寫入的固定週期（秒）。不建議設 <5 秒 |
+| `SENSOR_HEARTBEAT_INTERVAL` | `3600` | 心跳保底（秒）：距上次實際寫入超過這個時間就強制補寫一筆，不管 `upload_condition` 判斷結果。設 `0` 關閉，**但不建議** |
+| `OPCUA_PUBLISH_INTERVAL_MS` | `1000` | **全域**預設訂閱取樣頻率（毫秒）。優先序：`sensors.opcua_sampling_interval_ms`（逐感測器）> `opcua_servers.publish_interval_ms`（逐 Server）> 本值 |
+| `OPCUA_CLIENT_TIMEOUT` | `10` | 單次 OPC UA 請求逾時秒數，網路不穩的場域可調高 |
+| `OPCUA_HEARTBEAT_INTERVAL_SEC` / `_TIMEOUT_SEC` / `_MAX_FAILURES` | `15` / `8` / `2` | 心跳週期、單次心跳逾時、連續失敗幾次才判定斷線。調高可容忍偶發逾時，避免頻繁整組重建訂閱 |
+| `MQTT_ENABLED` | `true` | 設為 `false` 完全不建立 MQTT 連線 |
+| `ADMIN_USER` / `ADMIN_PASSWORD` / `ADMIN_PORT` | — | 網頁後台的登入帳密與埠號，**務必改掉預設值** |
+
+> `.env` 已列入 `.gitignore`，請勿提交；`env.example` 只放範例值，不要填入正式環境的密碼。
 
 ### 3. 執行資料庫 Migration
 
-依序執行 `sql/` 內的腳本（001 ~ 007）。**既有系統升級**至少要補跑最新的兩支：
+**全新部署**：依序執行 `sql/` 內的腳本（002 ~ 005 不存在，跳過即可）。`000` 會建立
+即時層四張表，`001` 建立階層表與 `sensor_readings` hypertable，其餘補欄位。
+
+```bash
+for f in sql/0*.sql; do
+  psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -f "$f" || break
+done
+```
+
+**既有系統升級**：補跑還沒跑過的那幾支即可，全部腳本都是 idempotent，重複執行安全。
 
 ```bash
 psql -h <DB_HOST> -U <DB_USER> -d <DB_NAME> -f sql/006_opcua_upgrade.sql
 psql -h <DB_HOST> -U <DB_USER> -d <DB_NAME> -f sql/007_opcua_deadband.sql
+psql -h <DB_HOST> -U <DB_USER> -d <DB_NAME> -f sql/008_missing_app_columns.sql
+psql -h <DB_HOST> -U <DB_USER> -d <DB_NAME> -f sql/009_opcua_server_publish_interval.sql
+psql -h <DB_HOST> -U <DB_USER> -d <DB_NAME> -f sql/010_cumulative_counter_upload_condition.sql
 ```
 
-兩支都可重複執行（idempotent）。`006` 幫 `sensors` 加上
-`opcua_sampling_interval_ms` / `upload_condition` / `upload_threshold`，
-並把既有感測器預設成 `threshold_percent` + 門檻 `1`；`007` 加上
-`opcua_deadband_type` / `opcua_deadband_value`。
+`006` 幫 `sensors` 加上 `opcua_sampling_interval_ms` / `upload_condition` /
+`upload_threshold`；`007` 加上 `opcua_deadband_type` / `opcua_deadband_value`；
+`008` 補齊 `sensors.nickname` / `state_dictionary`、`opcua_servers.resubscribe_requested`、
+`modbus_scada.unit` 等「程式碼在用但沒有腳本建立」的欄位；`009` 加上
+`opcua_servers.publish_interval_ms`；`010` 把累計型感測器的 `upload_condition`
+改成 `on_change`（**既有部署一定要跑**，否則累計型點位會長期沒有新資料）。
+
+> ⚠️ migration 要用**資料表擁有者**執行。應用程式帳號（`.env` 裡的 `DB_USER`）
+> 通常只有 `SELECT / INSERT / UPDATE`，沒有 `ALTER TABLE` 權限，拿它跑會失敗。
+> 例外：`010` 只有 `UPDATE`、不改 schema，用應用程式帳號也跑得動。
+
+> 💡 即時層四張表由 `000` 建立，`001` 才對它們加 `sensor_id`，所以 `000` 一定要先跑。
+> 既有環境四張表都已存在，全部 `CREATE` 都是 `IF NOT EXISTS`，跑了不會動到現有資料。
 
 > ⚠️ 若使用非 superuser 角色連線，記得確認該角色對相關資料表有
 > `SELECT / INSERT / UPDATE / DELETE` 權限，且序列 (sequence) 要另外 GRANT。
@@ -377,8 +393,8 @@ OPC UA 完全不在這個迴圈裡，走獨立的常駐背景服務（見下方�
 | `opcua_sampling_interval_ms` | INTEGER | OPC UA 訂閱該點位的取樣頻率（毫秒），NULL = 沿用 Server 層級預設值 |
 | `opcua_deadband_type` | VARCHAR(20) | `none` / `percent` / `absolute`，伺服器端 DataChangeFilter 判斷方式 |
 | `opcua_deadband_value` | NUMERIC | 搭配 `opcua_deadband_type` 使用的門檻值 |
-| `upload_condition` | VARCHAR(20) | `always` / `on_change` / `threshold_percent` / `threshold_absolute`，預設 `threshold_percent` |
-| `upload_threshold` | NUMERIC | 搭配 `upload_condition` 使用的門檻值（百分比數字或絕對值），預設 `1`（1%） |
+| `upload_condition` | VARCHAR(20) | `always` / `on_change` / `threshold_percent` / `threshold_absolute`，新建感測器預設 `threshold_percent`。**累計型計數器請用 `on_change`**，見上方第 4 節的警告 |
+| `upload_threshold` | NUMERIC | 搭配 `upload_condition` 使用的門檻值（百分比數字或絕對值）。`always` / `on_change` 時不生效；為 NULL 時程式會 fallback（`threshold_percent` → 1%、`threshold_absolute` → 0），`010` 已把門檻型的 NULL 補成顯式的 `1` |
 
 ---
 
@@ -415,6 +431,7 @@ OPC UA 完全不在這個迴圈裡，走獨立的常駐背景服務（見下方�
 | `main.py` | 主程式入口，依 `.env` 開關決定啟動哪些協議 |
 | `admin_app.py` | 網頁管理後台（Streamlit），分頁依 `.env` 開關動態顯示 |
 | `run_all.py` | 同時啟動 `main.py` 與 `admin_app.py` |
+| `sql/` | 資料庫 migration，執行順序與編號斷層說明見 [`sql/README.md`](sql/README.md) |
 
 ---
 
@@ -425,7 +442,10 @@ OPC UA 完全不在這個迴圈裡，走獨立的常駐背景服務（見下方�
 | 設定 `MODBUS_ENABLED=false` 後網頁還看得到 Modbus 分頁 | 確認用的是新版 `admin_app.py`（分頁清單依開關動態組出），並確認 `.env` 真的被載入（`ADMIN_PORT` 等其他變數有沒有生效可以交叉驗證） |
 | `sensor_readings` 好像變比較慢才有新資料 | 這是預期行為：v2 改成 `SENSOR_READING_FLUSH_INTERVAL` 固定週期統一寫入（預設 60 秒），不是採集到就馬上寫；調小這個值可以縮短延遲，但太小意義不大且會增加 DB 負擔 |
 | 感測器調了 `upload_condition` 沒有立即生效 | 最慢下一個 `SENSOR_READING_FLUSH_INTERVAL` 週期才會套用新設定（背景排程每輪都會重新讀一次 `sensors` 表），不是即時的 |
+| **某個感測器完全沒有新資料，但 OPC UA 連線正常、`opcua_tags.current_data` 也一直在變** | 先查它的 `upload_condition`。若是**累計型計數器**套用 `threshold_percent`，基準值百萬等級時「變化 1%」要累積四十幾天，判斷永遠不成立，而且不會有任何錯誤 log。改成 `on_change`（或跑 `sql/010`）。驗證方式：`SELECT upload_condition, upload_threshold FROM sensors WHERE sensor_id=<id>;` 再比對 `sensor_readings` 最後一筆的值與 `opcua_tags` 目前值差幾 %。心跳保底生效後，這種點位至少仍會每 `SENSOR_HEARTBEAT_INTERVAL` 有一筆，不會完全消失 |
+| **資料庫裡的時間戳比實際時間少 8 小時**（`opcua_tags.last_update` 看起來像早就停止更新） | 容器沒有設定 `TZ` 時跑在 UTC，程式若用 naive 的 `datetime.now()` 寫進 `timestamptz` 欄位，PostgreSQL 會照 session 的 `+08` 解讀，結果整批偏移。程式端已全部改用 `datetime.now().astimezone()`；若自行新增寫入時間的程式碼，**務必也帶時區**。快速確認：`docker exec <容器> date` 跟主機 `date` 對一下 |
 | `sensors.upload_threshold` / `opcua_deadband_value` 存檔報欄位不存在 | 尚未執行 `sql/006_opcua_upgrade.sql` / `sql/007_opcua_deadband.sql`，補跑 migration |
+| 在網頁上改感測器的上傳條件，存檔報 `violates check constraint "chk_sensors_upload_condition"` | 資料庫套用的是 `006` 的舊版本，該版 CHECK 只允許 `always` / `on_change` / `threshold`，擋掉了現在使用的 `threshold_percent` / `threshold_absolute`。重跑最新版 `sql/006_opcua_upgrade.sql` 即可（會自動把遺留的 `threshold` 轉成 `threshold_absolute` 再換上新的 constraint） |
 | OPC UA log 出現 `Revised values returned differ from subscription values` | 正常訊息，代表伺服器端修改了實際生效的訂閱參數（常見於固定內部更新週期的設備，例如收到 `RevisedPublishingInterval=1000.0` 代表該設備不管你要求多慢，都用自己的 1 秒週期）。這種設備調整 `opcua_sampling_interval_ms` 不會真的降低它的負載，改用 `opcua_deadband_type=absolute` 從伺服器端過濾雜訊才有實際效果 |
 | OPC UA 連線頻繁斷線重連，但重連都很快成功 | 通常是網路品質問題，不是程式邏輯錯誤；可以調高 `OPCUA_CLIENT_TIMEOUT` / `OPCUA_HEARTBEAT_MAX_FAILURES` 減少誤判次數、降低 log 噪音，但無法讓底層網路本身變穩定；若斷線頻率有規律性（例如每隔固定分鐘），較可能是網路設備（NAT timeout 等）問題 |
 | 設定了 `opcua_deadband_type=percent` 但沒有效果 | Percent deadband 依賴節點是否設定 EURange（工程量測範圍），很多設備（尤其協議轉換盒）不會主動配置，導致此設定被忽略；改用 `absolute` |
@@ -434,4 +454,14 @@ OPC UA 完全不在這個迴圈裡，走獨立的常駐背景服務（見下方�
 | `permission denied for table sensor_readings` | DB 使用者權限不足，用管理員帳號補 `GRANT`，並設定 `ALTER DEFAULT PRIVILEGES`；PostgreSQL 的 GRANT 對表和序列 (sequence) 是分開的 |
 | `run_all.py` 啟動報 `FileNotFoundError: ... 'streamlit'` | 虛擬環境本身沒裝 streamlit，或沒用 `sys.executable -m streamlit` 啟動 |
 
-更多細節（含每次功能調整的背景與已知取捨）請見 `UPGRADE_NOTES_v2.md`。
+---
+
+## 📚 文件導覽
+
+| 文件 | 內容 |
+| --- | --- |
+| **README.md**（本檔） | 功能總覽、安裝設定、執行架構、網頁操作、常見問題排查 |
+| [`README_DB.md`](README_DB.md) | 資料庫 schema 參考：即時層四張表的完整欄位定義、時序層階層表、寫入規則 |
+| [`sql/README.md`](sql/README.md) | migration 的執行順序、各檔用途、編號 002~005 斷層的原因 |
+| [`UPGRADE_NOTES_v2.md`](UPGRADE_NOTES_v2.md) | v1 → v2 的行為變化、部署步驟、已知取捨 |
+| [`todo.md`](todo.md) | 待辦事項與已知技術債（含資料量成長、schema 漂移防範） |

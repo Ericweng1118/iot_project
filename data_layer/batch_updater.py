@@ -84,7 +84,7 @@ def batch_update_opcua_tags(server_id, server_name, tags):
     if not tags:
         return
 
-    now = datetime.now()
+    now = datetime.now().astimezone()
     processed_rows = [
         (
             server_id,
@@ -140,7 +140,7 @@ def batch_update_opcua_values(server_id, rows):
     if not rows:
         return
 
-    now = datetime.now()
+    now = datetime.now().astimezone()
     processed_rows = [
         (
             server_id,
@@ -170,3 +170,50 @@ def batch_update_opcua_values(server_id, rows):
         logger.debug(f"[訂閱模式] 成功批量更新 {len(rows)} 筆 OPC UA 點位數值 (server_id={server_id})。")
     except Exception as e:
         logger.error(f"[訂閱模式] 批量更新 OPC UA 點位數值失敗 (server_id={server_id}): {e}")
+
+
+def set_opcua_bound_tags_state(server_id, state):
+    """
+    把某台 Server 底下「已綁定感測器」的點位，整批標記成指定的連線狀態。
+
+    為什麼需要這支：
+        原本 opcua_tags.plc_state 只有寫入 'ONLINE' 的路徑
+        （batch_update_opcua_tags 瀏覽時寫死 ONLINE、batch_update_opcua_values
+        由訂閱 flush 帶入 ONLINE），斷線時只會更新 opcua_servers.conn_state，
+        完全不會回頭改 opcua_tags。結果是點位一旦上線就永遠停在 ONLINE，
+        網頁「異常監控」的連線異常查詢因此永遠偵測不到 OPC UA 斷線。
+
+    為什麼只動「已綁定」的點位：
+        v2 起只有綁定 sensor_id 的點位會真的被訂閱、被持續更新。未綁定的點位
+        本來就停留在上次瀏覽的快照，對它們談「連線狀態」沒有意義；若一併標成
+        OFFLINE，未綁定的點位（本專案正式庫有 2745 筆）會塞爆異常清單，
+        把真正需要注意的點位淹掉。
+
+    :param server_id: opcua_servers.id
+    :param state: 'ONLINE' / 'OFFLINE'
+    :return: 實際被更新的筆數
+    """
+    query = """
+        UPDATE opcua_tags
+        SET plc_state = %s
+        WHERE server_id = %s
+          AND sensor_id IS NOT NULL
+          AND plc_state IS DISTINCT FROM %s;
+    """
+    try:
+        with DatabaseConnector.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (state, server_id, state))
+                affected = cur.rowcount
+        if affected:
+            logger.info(
+                f"[訂閱模式] server_id={server_id} 的 {affected} 個已綁定點位"
+                f"連線狀態已標記為 {state}。"
+            )
+        return affected
+    except Exception as e:
+        logger.error(
+            f"[訂閱模式] 標記 opcua_tags 連線狀態失敗 "
+            f"(server_id={server_id}, state={state}): {e}"
+        )
+        return 0

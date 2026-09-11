@@ -89,7 +89,7 @@ def _collect_one_plc(plc_ip, db_groups):
     這台 PLC 連線逾時或失敗，只會拖慢自己這條執行緒，不影響其他 PLC。
     """
     rows = []
-    now = datetime.now()
+    now = datetime.now().astimezone()
     collector = SiemensS7Collector(ip=plc_ip)
 
     if not collector.connect():

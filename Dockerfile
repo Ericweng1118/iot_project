@@ -46,10 +46,10 @@ RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
 COPY . .
 
 # 預設開放 Streamlit 埠號
-EXPOSE 8501
+EXPOSE 1118
 
 CMD ["python", "run_all.py"]
 
-# sudo docker build -t unified_collector:20260724 .
+# sudo docker build -t unified_collector:20260911 .
 
-# sudo docker save unified_collector:20260724 | gzip > .docker_images/unified_collector_20260724.tar.gz
+# sudo docker save unified_collector:20260911 | gzip > .docker_images/unified_collector_20260911.tar.gz

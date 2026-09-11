@@ -24,6 +24,11 @@ data_layer/timeseries_writer.py
                                     退化為「數值不再是 0 就寫」
              - threshold_absolute: 變化「絕對值」達到 upload_threshold 才寫
 
+      3. 心跳保底（SENSOR_HEARTBEAT_INTERVAL，預設 3600 秒）
+         不論 upload_condition 判斷結果如何，只要距離上次實際寫入超過這個時間
+         就強制補寫一筆。這是 v1 就有、v2 初版漏掉後又補回來的保護：沒有它，
+         門檻設錯的點位會靜悄悄地完全沒有資料，且不會有任何錯誤訊息。
+
     也就是「多久寫一次」是全域參數（.env），「這次要不要寫」是逐感測器規則
     （sensors 表，可在網頁「感測器階層管理」分頁調整：百分比 / 絕對值 / 不判斷，
     最慢下一輪就生效）。
@@ -60,12 +65,28 @@ def _parse_env_float(key: str, default: float) -> float:
 
 
 class SensorReadingWriter:
-    def __init__(self, flush_interval_seconds=None):
+    def __init__(self, flush_interval_seconds=None, heartbeat_interval_seconds=None):
         # 統一寫入週期（秒）：來源 .env SENSOR_READING_FLUSH_INTERVAL，預設 60 秒
         self.flush_interval = (
             float(flush_interval_seconds)
             if flush_interval_seconds is not None
             else _parse_env_float("SENSOR_READING_FLUSH_INTERVAL", 60.0)
+        )
+
+        # 心跳保底（秒）：來源 .env SENSOR_HEARTBEAT_INTERVAL，預設 3600 秒。
+        # 距離上次實際寫入超過這個時間，無論 upload_condition 判斷結果如何都強制
+        # 補寫一筆。設為 0（或負數）代表關閉心跳。
+        #
+        # 為什麼需要：v1 的寫入邏輯本來就有「值沒變也每小時補一筆」的保底，v2 改成
+        # 統一排程 + upload_condition 判斷時漏掉了這段，結果是門檻設得不合理的點位
+        # 會**完全沒有任何紀錄、也不會有任何錯誤 log**，只能靠人工發現。實際踩過的
+        # 案例：累計型電表（值百萬等級、日增量幾百）套用預設 1% 的 threshold_percent，
+        # 要累積四十幾天才寫得進一筆，看起來就像採集壞掉，但其實 OPC UA 一切正常。
+        # 心跳補寫讓「沒有新資料」跟「系統掛了」在資料上可以區分開來。
+        self.heartbeat_interval = (
+            float(heartbeat_interval_seconds)
+            if heartbeat_interval_seconds is not None
+            else _parse_env_float("SENSOR_HEARTBEAT_INTERVAL", 3600.0)
         )
 
         # sensor_id -> (value: float, time: datetime)　最新收到的值（尚未必然寫入）
@@ -180,7 +201,10 @@ class SensorReadingWriter:
         for sensor_id, (value, ts) in snapshot.items():
             condition, threshold = upload_config.get(sensor_id, ("always", None))
             last = last_written.get(sensor_id)
-            write_it, reason = self._should_write_with(condition, threshold, last, value)
+            write_it, reason = self._should_write_with(
+                condition, threshold, last, value,
+                now=ts, heartbeat_interval=self.heartbeat_interval,
+            )
             logger.debug(
                 f"🧾 統一寫入判斷: sensor_id={sensor_id}, value={value}, "
                 f"要寫入={write_it}（{reason}）"
@@ -213,7 +237,9 @@ class SensorReadingWriter:
             return 0
 
     @staticmethod
-    def _should_write_with(condition, threshold, last, value):
+    def _should_write_with(
+        condition, threshold, last, value, now=None, heartbeat_interval=0.0
+    ):
         """
         判斷這個 sensor 這一輪要不要寫。condition 四選一：
             always            - 不判斷，每輪都寫
@@ -221,13 +247,27 @@ class SensorReadingWriter:
             threshold_percent - 變化百分比（以上次寫入值為基準）達到 threshold 才寫，
                                  threshold 以「百分比數字」表示（例如 1 代表 1%）
             threshold_absolute- 變化絕對值達到 threshold 才寫
+
+        不論上面哪一種，只要距離上次實際寫入超過 heartbeat_interval 秒，就強制
+        補寫一筆（心跳保底），避免門檻設定不合理的點位在資料上完全消失。
+        傳入 heartbeat_interval <= 0 代表關閉心跳。
         """
         if last is None:
             return True, "首次出現"
         if condition == "always":
             return True, "always（不判斷）"
 
-        last_value, _ = last
+        last_value, last_time = last
+
+        # 心跳保底：擺在所有門檻判斷之前，確保任何 condition 都有最低寫入頻率。
+        # 時間資訊缺漏或 naive/aware 混用時，寧可跳過心跳也不要讓整輪寫入炸掉。
+        if heartbeat_interval and heartbeat_interval > 0 and now is not None and last_time is not None:
+            try:
+                elapsed = (now - last_time).total_seconds()
+            except TypeError:
+                elapsed = None
+            if elapsed is not None and elapsed >= heartbeat_interval:
+                return True, f"心跳補寫（距上次寫入 {elapsed:.0f} 秒 >= {heartbeat_interval:.0f} 秒）"
 
         if condition == "on_change":
             if value != last_value:
@@ -268,7 +308,9 @@ class SensorReadingWriter:
     # ------------------------------------------------------------
     def _loop(self):
         logger.info(
-            f"🕒 SensorReadingWriter 統一寫入排程已啟動，週期 = {self.flush_interval} 秒"
+            f"🕒 SensorReadingWriter 統一寫入排程已啟動，週期 = {self.flush_interval} 秒，"
+            f"心跳保底 = "
+            + (f"{self.heartbeat_interval} 秒" if self.heartbeat_interval > 0 else "關閉")
         )
         while not self._stop_event.is_set():
             # 每一輪先重新整理 upload_condition 設定，

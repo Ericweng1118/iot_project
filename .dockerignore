@@ -1,0 +1,25 @@
+# 虛擬環境與快取
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+
+# 版控與本機產出物
+.git/
+.gitignore
+.dockerignore
+.backup/
+.docker_images/
+
+# 機密（容器改用 --env-file 或 compose 注入）
+.env
+.env.*
+
+# 文件（不影響執行）
+*.md
+docs/
+
+# 編輯器
+.vscode/
+.idea/

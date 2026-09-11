@@ -1,10 +1,25 @@
-/.env
-/.backup
-.gitignore
+# ===== 環境變數 / 機密 =====
+.env
+.env.*
+!env.example
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ===== 虛擬環境 =====
 .venv/
 venv/
-/.docker_images
-.dockerignore
-.gitignore
-001_sensor_hierarchy_and_mapping.sql
-INTEGRATION_GUIDE.md
+ENV/
+
+# ===== 本機備份與產出物（不進版控，靠 git 歷史即可）=====
+.backup/
+.docker_images/
+*.tar.gz
+
+# ===== 編輯器 / OS =====
+.vscode/
+.idea/
+.DS_Store

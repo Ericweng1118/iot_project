@@ -420,6 +420,44 @@ def _find_binding_conflict(binding_map, sensor_id, table, point_id):
     return "、".join(others) if others else None
 
 
+def _sensor_select_options(label_to_id, binding_map, keep_ids=()):
+    """
+    產生「綁定感測器」下拉選單的選項清單：把已經被其他點位綁走的感測器濾掉，
+    選單只留下「還沒有人綁」的感測器，避免上百個已綁定項目把選單塞爆。
+
+    ⚠️ keep_ids 是必要的，不能單純把所有已綁定的都拿掉：
+        Streamlit 的 SelectboxColumn 是「整欄共用一份 options」，沒辦法逐列給
+        不同選項。已經有綁定的那些列，它自己目前的值一定要留在 options 裡，
+        否則該儲存格的值不在選項內，Streamlit 會顯示成空白甚至丟出例外，
+        使用者只要按一次儲存就會把原本的綁定洗掉。
+        所以呼叫端要把「目前畫面上這些列自己已綁定的 sensor_id」傳進來。
+
+    :param label_to_id: _load_sensor_options() 回傳的 label -> sensor_id
+    :param binding_map: _load_sensor_binding_map() 回傳的 sensor_id -> [已綁定的點位]
+    :param keep_ids: 即使已被綁定也要保留在選單中的 sensor_id（通常是本畫面各列自己的綁定）
+    :return: (options 清單, 被濾掉的數量)
+    """
+    keep = {int(s) for s in keep_ids if s is not None}
+    options = [UNBOUND_LABEL]
+    hidden = 0
+    for label, sid in label_to_id.items():
+        if sid in binding_map and sid not in keep:
+            hidden += 1
+            continue
+        options.append(label)
+    return options, hidden
+
+
+def _binding_filter_caption(hidden_count):
+    """選單過濾後的提示文字；沒有被濾掉任何項目時回傳 None（就不用顯示提示）。"""
+    if not hidden_count:
+        return None
+    return (
+        f"🔎 已隱藏 {hidden_count} 個「已被其他點位綁定」的感測器，選單只列出尚未綁定的。"
+        "要把感測器改綁到別的點位，請先把原本那個點位改成「（未綁定）」並儲存。"
+    )
+
+
 def request_opcua_resubscribe(server_id: int):
     """
     通知常駐的 OPC UA 訂閱服務：該 Server 的點位表已更新，
@@ -523,8 +561,17 @@ def _render_modbus_tab():
 
     df_modbus = load_modbus_tags()
     modbus_label_to_id, modbus_id_to_label = _load_sensor_options()
+    # 綁定選單共用：只列出尚未被任何點位綁走的感測器。
+    # 放在分頁層級（不是 if not df.empty 裡面），因為下方的「單筆新增」表單也要用，
+    # 表格為空時仍必須有值可用。
+    modbus_binding_map = _load_sensor_binding_map()
+    modbus_free_options, _ = _sensor_select_options(modbus_label_to_id, modbus_binding_map)
 
     st.subheader("📋 Modbus 點位列表（可直接於表格內修改參數）")
+    st.caption(
+        "此表格為**編輯既有資料**用：新增請使用下方的專用表單。"
+        "刪除目前沒有提供網頁入口，需要時請直接在資料庫執行 DELETE。"
+    )
     if not df_modbus.empty:
         # 把 sensor_id 轉成人類可讀的 sensor_label 欄位，供下拉選單編輯，
         # 存檔時再反查回 sensor_id。
@@ -535,24 +582,41 @@ def _render_modbus_tab():
         )
         df_modbus_display = df_modbus.drop(columns=["sensor_id"])
 
+        # current_data / current_value / plc_state / last_update 都是採集程式寫入的
+        # 執行期欄位，儲存邏輯不會把它們寫回去，因此一律鎖住避免使用者白改一場。
         disabled_cols_modbus = [
             "id",
             "plc_state",
             "current_value",
+            "current_data",
             "last_update",
         ]
 
+        # keep_ids 保留本畫面各列自己的綁定，否則值不在 options 內會被 Streamlit 清空。
+        modbus_options, modbus_hidden = _sensor_select_options(
+            modbus_label_to_id,
+            modbus_binding_map,
+            keep_ids=df_modbus["sensor_id"].dropna().astype(int).tolist(),
+        )
+        _cap = _binding_filter_caption(modbus_hidden)
+        if _cap:
+            st.caption(_cap)
+
         edited_modbus_df = st.data_editor(
             df_modbus_display,
-            num_rows="dynamic",
+            # ⚠️ 這裡刻意用 "fixed" 而非 "dynamic"：儲存邏輯只會對既有列做 UPDATE，
+            #    表格上新增的列（id 為空）會被略過、刪掉的列也不會真的從資料庫移除。
+            #    開著 dynamic 會讓使用者以為新增/刪除成功（還會跳「儲存成功」），
+            #    實際上什麼都沒發生。新增請用下方的專用表單。
+            num_rows="fixed",
             key="modbus_editor",
             disabled=disabled_cols_modbus,
             width="stretch",
             column_config={
                 "sensor_label": st.column_config.SelectboxColumn(
                     "綁定感測器 (sensor_code)",
-                    options=[UNBOUND_LABEL] + list(modbus_label_to_id.keys()),
-                    help="選擇這個點位對應的感測器，數值會同步寫入 sensor_readings 時序表。"
+                    options=modbus_options,
+                    help="只列出尚未被其他點位綁定的感測器。"
                     "選單內容請先在「感測器階層管理」分頁建立。",
                 )
             },
@@ -595,12 +659,12 @@ def _render_modbus_tab():
                                     continue
 
                                 sql = """
-                                UPDATE modbus_scada SET 
-                                    name=%s, plc_ip=%s, plc_port=%s, slave_id=%s, 
+                                UPDATE modbus_scada SET
+                                    name=%s, plc_ip=%s, plc_port=%s, slave_id=%s,
                                     function_code=%s, start_address=%s, data_type=%s,
                                     raw_min=%s, raw_max=%s, eng_min=%s, eng_max=%s,
                                     byte_order=%s, word_order=%s, state_dictionary=%s,
-                                    sensor_id=%s
+                                    unit=%s, sensor_id=%s
                                 WHERE id=%s;
                                 """
                                 cur.execute(
@@ -628,6 +692,11 @@ def _render_modbus_tab():
                                         row["byte_order"],
                                         row["word_order"],
                                         state_dict_val,  # 已由 _normalize_state_dict 正規化為合法 JSON 字串或 None
+                                        # unit 原本漏掉沒帶進 UPDATE：欄位在表格裡可以編輯、
+                                        # 存檔也會顯示成功，但值其實從來沒被寫回去
+                                        str(row["unit"]).strip()
+                                        if pd.notnull(row["unit"]) and str(row["unit"]).strip()
+                                        else None,
                                         sensor_id,
                                         point_id,
                                     ),
@@ -698,8 +767,9 @@ def _render_modbus_tab():
             )
             m_sensor_label = st.selectbox(
                 "綁定感測器 (sensor_code，可留空)",
-                [UNBOUND_LABEL] + list(modbus_label_to_id.keys()),
-                help="選填，之後也可以在上方表格內再綁定/修改。",
+                modbus_free_options,
+                help="選填，只列出尚未被其他點位綁定的感測器；"
+                "之後也可以在上方表格內再綁定/修改。",
             )
 
         btn_col1, btn_col2 = st.columns([1, 1])
@@ -832,8 +902,17 @@ def _render_tia_tab():
 
     df_tia = load_tia_tags()
     tia_label_to_id, tia_id_to_label = _load_sensor_options()
+    # 綁定選單共用：只列出尚未被任何點位綁走的感測器。
+    # 放在分頁層級（不是 if not df.empty 裡面），因為下方的「單筆新增」表單也要用，
+    # 表格為空時仍必須有值可用。
+    tia_binding_map = _load_sensor_binding_map()
+    tia_free_options, _ = _sensor_select_options(tia_label_to_id, tia_binding_map)
 
     st.subheader("📋 TIA 點位列表（可直接於表格內修改參數）")
+    st.caption(
+        "此表格為**編輯既有資料**用：新增請使用下方的專用表單。"
+        "刪除目前沒有提供網頁入口，需要時請直接在資料庫執行 DELETE。"
+    )
     if not df_tia.empty:
         df_tia["sensor_label"] = df_tia["sensor_id"].apply(
             lambda sid: tia_id_to_label.get(int(sid), UNBOUND_LABEL)
@@ -844,17 +923,31 @@ def _render_tia_tab():
 
         disabled_cols_tia = ["id", "plc_state", "current_data", "last_update"]
 
+        # keep_ids 保留本畫面各列自己的綁定，否則值不在 options 內會被 Streamlit 清空。
+        tia_options, tia_hidden = _sensor_select_options(
+            tia_label_to_id,
+            tia_binding_map,
+            keep_ids=df_tia["sensor_id"].dropna().astype(int).tolist(),
+        )
+        _cap = _binding_filter_caption(tia_hidden)
+        if _cap:
+            st.caption(_cap)
+
         edited_tia_df = st.data_editor(
             df_tia_display,
-            num_rows="dynamic",
+            # ⚠️ 這裡刻意用 "fixed" 而非 "dynamic"：儲存邏輯只會對既有列做 UPDATE，
+            #    表格上新增的列（id 為空）會被略過、刪掉的列也不會真的從資料庫移除。
+            #    開著 dynamic 會讓使用者以為新增/刪除成功（還會跳「儲存成功」），
+            #    實際上什麼都沒發生。新增請用下方的專用表單。
+            num_rows="fixed",
             key="tia_editor",
             disabled=disabled_cols_tia,
             width="stretch",
             column_config={
                 "sensor_label": st.column_config.SelectboxColumn(
                     "綁定感測器 (sensor_code)",
-                    options=[UNBOUND_LABEL] + list(tia_label_to_id.keys()),
-                    help="選擇這個點位對應的感測器，數值會同步寫入 sensor_readings 時序表。"
+                    options=tia_options,
+                    help="只列出尚未被其他點位綁定的感測器。"
                     "選單內容請先在「感測器階層管理」分頁建立。",
                 )
             },
@@ -934,8 +1027,9 @@ def _render_tia_tab():
             )
             t_sensor_label = st.selectbox(
                 "綁定感測器 (sensor_code，可留空)",
-                [UNBOUND_LABEL] + list(tia_label_to_id.keys()),
-                help="選填，之後也可以在上方表格內再綁定/修改。",
+                tia_free_options,
+                help="選填，只列出尚未被其他點位綁定的感測器；"
+                "之後也可以在上方表格內再綁定/修改。",
             )
 
         btn_col1, btn_col2 = st.columns([1, 1])
@@ -1031,20 +1125,37 @@ with tab_opcua:
     # 讀取 opcua_servers 清單
     # ----------------------------------------------------------
     def load_opcua_servers():
-        try:
+        """
+        讀取 Server 清單。publish_interval_ms 由 sql/009 建立，若該 migration
+        還沒跑，退回不含此欄位的查詢，只是少一個可編輯欄位，不讓整個
+        OPC UA 分頁因為缺一個選填欄位就打不開。
+        """
+        base = """id, server_name, ip, port, username, password,
+                  security_policy, security_mode, root_node_id, browse_depth"""
+        tail = "enabled, conn_state, last_scan, last_error"
+
+        def _run(cols):
             with DatabaseConnector.get_connection() as conn:
                 with conn.cursor() as cur:
-                    query = """
-                    SELECT id, server_name, ip, port, username, password,
-                           security_policy, security_mode, root_node_id, browse_depth,
-                           enabled, conn_state, last_scan, last_error
-                    FROM opcua_servers
-                    ORDER BY id ASC;
-                    """
-                    cur.execute(query)
-                    cols = [desc[0] for desc in cur.description]
-                    rows = cur.fetchall()
-                    return pd.DataFrame(rows, columns=cols)
+                    cur.execute(
+                        f"SELECT {cols} FROM opcua_servers ORDER BY id ASC;"
+                    )
+                    names = [desc[0] for desc in cur.description]
+                    return pd.DataFrame(cur.fetchall(), columns=names)
+
+        try:
+            return _run(f"{base}, publish_interval_ms, {tail}")
+        except Exception:
+            pass
+
+        try:
+            df = _run(f"{base}, {tail}")
+            st.warning(
+                "⚠️ 尚未執行 `sql/009_opcua_server_publish_interval.sql`，"
+                "「逐 Server 預設取樣頻率」欄位暫時無法使用，"
+                "所有 Server 一律沿用 `.env` 的 `OPCUA_PUBLISH_INTERVAL_MS`。"
+            )
+            return df
         except Exception as e:
             st.error(f"無法讀取 OPC UA Server 清單: {e}")
             return pd.DataFrame()
@@ -1083,14 +1194,39 @@ with tab_opcua:
     # Server 清單（可直接編輯）
     # ----------------------------------------------------------
     st.subheader("📋 OPC UA Server 清單（可直接於表格內修改參數）")
+    st.caption(
+        "此表格為**編輯既有資料**用：新增請使用下方的專用表單。"
+        "刪除目前沒有提供網頁入口，需要時請直接在資料庫執行 DELETE。"
+    )
     if not df_opcua_servers.empty:
         disabled_cols_opcua = ["id", "conn_state", "last_scan", "last_error"]
 
+        st.caption(
+            "「publish_interval_ms」是這台 Server 的預設訂閱取樣頻率（毫秒），"
+            "留空代表沿用 .env 的 OPCUA_PUBLISH_INTERVAL_MS。"
+            "個別點位若在「感測器階層管理」設了 opcua_sampling_interval_ms，"
+            "該點位以感測器的設定為準（優先序：感測器 > Server > .env）。"
+        )
+
         edited_opcua_df = st.data_editor(
             df_opcua_servers,
-            num_rows="dynamic",
+            # ⚠️ 這裡刻意用 "fixed" 而非 "dynamic"：儲存邏輯只會對既有列做 UPDATE，
+            #    表格上新增的列（id 為空）會被略過、刪掉的列也不會真的從資料庫移除。
+            #    開著 dynamic 會讓使用者以為新增/刪除成功（還會跳「儲存成功」），
+            #    實際上什麼都沒發生。新增請用下方的專用表單。
+            num_rows="fixed",
             key="opcua_editor",
             disabled=disabled_cols_opcua,
+            column_config={
+                "publish_interval_ms": st.column_config.NumberColumn(
+                    "預設取樣頻率 (publish_interval_ms)",
+                    min_value=50,
+                    max_value=3600000,
+                    step=100,
+                    help="毫秒。留空 = 沿用 .env 的 OPCUA_PUBLISH_INTERVAL_MS。"
+                    "部分設備有自己固定的內部更新週期，會忽略這個請求值。",
+                ),
+            },
             width="stretch",
         )
 
@@ -1100,29 +1236,40 @@ with tab_opcua:
                     with conn.cursor() as cur:
                         for index, row in edited_opcua_df.iterrows():
                             if pd.notnull(row["id"]):
-                                sql = """
+                                # sql/009 還沒跑時欄位不存在，這裡跟著跳過，
+                                # 其餘參數照常儲存
+                                has_interval = "publish_interval_ms" in edited_opcua_df.columns
+                                interval_set = (
+                                    "publish_interval_ms=%s," if has_interval else ""
+                                )
+                                sql = f"""
                                 UPDATE opcua_servers SET
                                     server_name=%s, ip=%s, port=%s, username=%s, password=%s,
                                     security_policy=%s, security_mode=%s, root_node_id=%s,
-                                    browse_depth=%s, enabled=%s
+                                    browse_depth=%s, {interval_set} enabled=%s
                                 WHERE id=%s;
                                 """
-                                cur.execute(
-                                    sql,
-                                    (
-                                        row["server_name"],
-                                        row["ip"],
-                                        int(row["port"]),
-                                        row["username"] if pd.notnull(row["username"]) else None,
-                                        row["password"] if pd.notnull(row["password"]) else None,
-                                        row["security_policy"],
-                                        row["security_mode"],
-                                        row["root_node_id"],
-                                        int(row["browse_depth"]),
-                                        bool(row["enabled"]),
-                                        int(row["id"]),
-                                    ),
-                                )
+                                params = [
+                                    row["server_name"],
+                                    row["ip"],
+                                    int(row["port"]),
+                                    row["username"] if pd.notnull(row["username"]) else None,
+                                    row["password"] if pd.notnull(row["password"]) else None,
+                                    row["security_policy"],
+                                    row["security_mode"],
+                                    row["root_node_id"],
+                                    int(row["browse_depth"]),
+                                ]
+                                if has_interval:
+                                    # 留空 = NULL = 沿用 .env 全域值（不是 0，0 會被
+                                    # CHECK constraint 擋下，語意也與「未指定」不同）
+                                    params.append(
+                                        int(row["publish_interval_ms"])
+                                        if pd.notnull(row["publish_interval_ms"])
+                                        else None
+                                    )
+                                params += [bool(row["enabled"]), int(row["id"])]
+                                cur.execute(sql, tuple(params))
                         conn.commit()
                 st.success(
                     "✅ OPC UA Server 參數更新成功！"
@@ -1351,6 +1498,19 @@ with tab_opcua:
 
         st.caption("💡 可直接在下方表格的「綁定感測器」欄位選擇對應感測器後按儲存。")
 
+        # 選單只列出「尚未被任何點位綁定」的感測器，避免上百個已綁定項目把選單塞爆。
+        # keep_ids 傳入本畫面各列自己目前的綁定，確保這些值仍留在 options 裡
+        # （SelectboxColumn 整欄共用一份選項，值不在選項內會被清空）。
+        opcua_binding_map = _load_sensor_binding_map()
+        opcua_options, opcua_hidden = _sensor_select_options(
+            opcua_label_to_id,
+            opcua_binding_map,
+            keep_ids=df_opcua_tags["sensor_id"].dropna().astype(int).tolist(),
+        )
+        _cap = _binding_filter_caption(opcua_hidden)
+        if _cap:
+            st.caption(_cap)
+
         disabled_cols_opcua_tags = [
             "id", "server_name", "node_id", "browse_name", "display_name",
             "data_type", "current_data", "quality", "plc_state", "last_update",
@@ -1364,8 +1524,8 @@ with tab_opcua:
             column_config={
                 "sensor_label": st.column_config.SelectboxColumn(
                     "綁定感測器 (sensor_code)",
-                    options=[UNBOUND_LABEL] + list(opcua_label_to_id.keys()),
-                    help="選擇這個點位對應的感測器，數值會同步寫入 sensor_readings 時序表。"
+                    options=opcua_options,
+                    help="只列出尚未被其他點位綁定的感測器。"
                     "選單內容請先在「感測器階層管理」分頁建立。",
                 )
             },
@@ -1426,12 +1586,19 @@ with tab_hierarchy:
     # 1. 廠區 (sites)
     # ------------------------------------------------------------
     st.subheader("🏭 廠區 (sites)")
+    st.caption(
+        "此表格為編輯既有廠區用；新增請使用下方表單。"
+        "刪除目前沒有網頁入口（廠區底下若還有產線，資料庫的外鍵也會擋下刪除）。"
+    )
     df_sites = _fetch_df(
         "SELECT site_id, site_name, location FROM sites ORDER BY site_id ASC;"
     )
     if not df_sites.empty:
         edited_sites = st.data_editor(
-            df_sites, num_rows="dynamic", key="sites_editor",
+            df_sites,
+            # ⚠️ 同上：儲存只做 UPDATE，新增請用下方「新增廠區」表單
+            num_rows="fixed",
+            key="sites_editor",
             disabled=["site_id"], width="stretch",
         )
         if st.button("💾 儲存廠區修改", key="save_sites"):
@@ -1945,13 +2112,41 @@ with tab_alerts:
     # ------------------------------------------------------------
     # 1. 連線異常：即時層三張表裡 plc_state 不是 ONLINE 的點位
     # ------------------------------------------------------------
-    st.subheader("🔌 連線異常（plc_state ≠ ONLINE）")
-    st.caption("代表這個點位上一輪採集時 PLC/Server 連不上，或讀取/解析失敗。")
+    st.subheader("🔌 連線異常")
+
+    # --- 1-1. Server 層級：OPC UA Server 本身連不上 ---
+    # 這一段是必要的：opcua_tags.plc_state 只反映「點位」層級，一台 Server 如果
+    # 底下還沒有任何已綁定的點位，斷線時不會有任何點位變成 OFFLINE，只有
+    # opcua_servers.conn_state 會記錄到。少了這一段就會整台 Server 斷線卻無人知曉。
+    st.markdown("**① OPC UA Server 連線狀態**")
+    df_server_offline = _fetch_df(
+        """
+        SELECT server_name AS Server名稱, ip, port, conn_state AS 連線狀態,
+               last_scan::text AS 最後連線時間, last_error AS 最後錯誤訊息
+        FROM opcua_servers
+        WHERE enabled = TRUE AND conn_state IS DISTINCT FROM 'ONLINE'
+        ORDER BY server_name;
+        """
+    )
+    if not df_server_offline.empty:
+        st.error(f"⚠️ 有 {len(df_server_offline)} 台已啟用的 OPC UA Server 目前連線異常")
+        st.dataframe(df_server_offline, width="stretch")
+    else:
+        st.success("✅ 所有已啟用的 OPC UA Server 連線正常")
+
+    # --- 1-2. 點位層級 ---
+    st.markdown("**② 點位連線狀態（plc_state ≠ ONLINE）**")
+    st.caption(
+        "代表這個點位上一輪採集時 PLC/Server 連不上，或讀取/解析失敗。"
+        "OPC UA 只列出**已綁定感測器**的點位 —— v2 起未綁定的點位不會被訂閱、"
+        "數值停留在上次瀏覽的快照，它們的連線狀態沒有參考意義。"
+    )
 
     _offline_queries = []
     if MODBUS_ENABLED:
         _offline_queries.append(
-            "SELECT 'Modbus' AS 來源, id, name AS 點位名稱, plc_ip, plc_state, last_update::text AS last_update "
+            "SELECT 'Modbus' AS 來源, id, name AS 點位名稱, plc_ip AS 位址, plc_state AS 狀態, "
+            "last_update::text AS 最後更新 "
             "FROM modbus_scada WHERE plc_state IS DISTINCT FROM 'ONLINE'"
         )
     if TIA_ENABLED:
@@ -1961,7 +2156,8 @@ with tab_alerts:
         )
     _offline_queries.append(
         "SELECT 'OPC UA', id, node_id, server_name, plc_state, last_update::text "
-        "FROM opcua_tags WHERE plc_state IS DISTINCT FROM 'ONLINE'"
+        "FROM opcua_tags "
+        "WHERE plc_state IS DISTINCT FROM 'ONLINE' AND sensor_id IS NOT NULL"
     )
 
     df_offline = _fetch_df(" UNION ALL ".join(_offline_queries) + " ORDER BY 1, 2;")
