@@ -23,3 +23,8 @@ docs/
 # 編輯器
 .vscode/
 .idea/
+tests/
+
+# 執行期資料（本機緩存要用 volume 掛載）、憑證（用 volume 或 secret 提供）
+data/
+certs/

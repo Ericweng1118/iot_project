@@ -14,16 +14,18 @@ def batch_update_tia_data(update_rows):
     if not update_rows:
         return
 
-    # 將 dict 轉為 JSON 字串供 PostgreSQL 識別
+    # 將 dict 轉為 JSON 字串供 PostgreSQL 識別；current_data 為 None 代表讀取失敗
     processed_rows = [
-        (row[0], json.dumps(row[1]), row[2]) for row in update_rows
+        (row[0], json.dumps(row[1], ensure_ascii=False) if row[1] is not None else None, row[2])
+        for row in update_rows
     ]
 
+    # v3.3：讀取失敗時保留最後一次的數值、只更新狀態（v2 會寫入 0，看起來像真的讀到 0）
     query = """
         UPDATE TIA_SCADA AS t
-        SET current_data = v.current_data::jsonb,
+        SET current_data = COALESCE(v.current_data::jsonb, t.current_data),
             plc_state = v.plc_state,
-            last_update = CURRENT_TIMESTAMP
+            last_update = CASE WHEN v.plc_state = 'ONLINE' THEN CURRENT_TIMESTAMP ELSE t.last_update END
         FROM (VALUES %s) AS v(id, current_data, plc_state)
         WHERE t.id = v.id;
     """

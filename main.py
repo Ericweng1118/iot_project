@@ -35,6 +35,14 @@ except ValueError:
 
 # 讀取 MQTT 是否啟用
 MQTT_ENABLED = _get_env_bool("MQTT_ENABLED", True)
+# 🆕 MQTT 是否也上傳 OPC UA 已綁定感測器的點位（Key = sensor_code）。
+#    預設 false 以維持既有下游的資料格式不變；純 OPC UA 部署要用 MQTT 時請設為 true。
+MQTT_INCLUDE_OPCUA = _get_env_bool("MQTT_INCLUDE_OPCUA", False)
+
+# 🆕 警報引擎（sql/011）：預設啟用，未執行 migration 時會自動暫停、不影響採集
+ALARM_ENABLED = _get_env_bool("ALARM_ENABLED", True)
+# 🆕 計算點（sql/017）：預設啟用，未執行 migration 時待命
+CALC_ENABLED = _get_env_bool("CALC_ENABLED", True)
 
 # 🆕 協議啟用開關：這次升級聚焦強化 OPC UA，
 #    Modbus / TIA(S7) 可透過 .env 完全屏蔽（不啟動採集執行緒，
@@ -47,6 +55,7 @@ OPCUA_ENABLED = _get_env_bool("OPCUA_ENABLED", True)
 from data_layer.db_connector import DatabaseConnector
 from data_layer.timeseries_writer import sensor_reading_writer
 from messaging.mqtt_publisher import MQTTPublisher
+from services.status_reporter import StatusReporter
 
 # 匯入採集模組：只匯入有啟用的協議，避免停用協議缺少對應套件
 # （例如沒裝 python-snap7 / pymodbus）時反而導致程式無法啟動。
@@ -57,8 +66,10 @@ OPCUASubscriptionService = None
 try:
     if MODBUS_ENABLED:
         from collector.run_modbus_collector import main as run_modbus_collector
+        from collector import run_modbus_collector as modbus_module
     if TIA_ENABLED:
         from collector.run_s7_collector import collect_s7_data as run_tia_collector
+        from collector import run_s7_collector as s7_module
     if OPCUA_ENABLED:
         from services.opcua_subscription_service import OPCUASubscriptionService
 except ImportError as e:
@@ -147,7 +158,19 @@ def fetch_latest_scada_map():
                     for row in cur.fetchall():
                         data_map[row[0]] = _safe_parse_val(row[1])
 
-                # OPC UA 目前先不併入 MQTT 上傳（測試階段，只採集存 DB）
+                # OPC UA：只送已綁定感測器的點位（未綁定的不會被訂閱更新，數值沒有意義），
+                # 以 sensor_code 當 Key（opcua_tags 的 node_id 太長且不具可讀性）
+                if OPCUA_ENABLED and MQTT_INCLUDE_OPCUA:
+                    cur.execute(
+                        """
+                        SELECT s.sensor_code, o.current_data->>'val'
+                        FROM opcua_tags o
+                        JOIN sensors s ON s.sensor_id = o.sensor_id
+                        WHERE o.current_data IS NOT NULL AND o.quality = 'GOOD';
+                        """
+                    )
+                    for row in cur.fetchall():
+                        data_map[row[0]] = _safe_parse_val(row[1])
 
     except Exception as e:
         logging.error(f"❌ 讀取 MQTT 數據來源失敗: {e}")
@@ -159,9 +182,18 @@ def main():
     logging.info("🚀 [IIoT 數據採集與 MQTT 上傳主服務] 啟動中...")
 
     # 1. 初始化 PostgreSQL 連線池
-    if not DatabaseConnector.initialize_pool():
-        logging.error("❌ PostgreSQL 連線池初始化失敗，主服務無法啟動！")
-        return
+    #    🆕 v3.1：資料庫暫時連不上時不直接結束，而是每 10 秒重試。
+    #    （點位設定都在資料庫裡，連上之前無法開始採集；但 DB 恢復後會自動接著跑，
+    #     不必等 run_all.py 的重啟退避。執行期間 DB 中斷則由本機緩存接手，不會遺失資料。）
+    attempt = 0
+    while not DatabaseConnector.initialize_pool():
+        attempt += 1
+        if not is_running:
+            return
+        logging.error(f"❌ PostgreSQL 連線失敗（第 {attempt} 次），10 秒後重試...")
+        wait_end = time.time() + 10
+        while is_running and time.time() < wait_end:
+            time.sleep(0.2)
 
     # 2. 🆕 啟動 sensor_readings 統一週期性寫入排程：
     #    載入初始快取後啟動背景執行緒，寫入週期由 .env 的
@@ -187,6 +219,51 @@ def main():
         opcua_service.start()
     else:
         logging.info("🔕 OPCUA_ENABLED=false，本次啟動不會啟動 OPC UA 訂閱服務。")
+
+    # 4.5 🆕 計算引擎（虛擬感測器：用運算式把其他感測器的即時值算成新的值）
+    calc_engine = None
+    if CALC_ENABLED:
+        from services.calc.engine import CalcEngine
+        calc_engine = CalcEngine()
+        calc_engine.start()
+
+    # 4.6 🆕 排程報表（sql/018；REPORT_SCHEDULER_ENABLED=false 可關閉）
+    from services.report_scheduler import ReportScheduler
+    report_scheduler = ReportScheduler()
+    report_scheduler.start()
+
+    # 5. 🆕 警報引擎（直接讀記憶體最新值判斷，不必等 sensor_readings 寫入週期）
+    alarm_engine = None
+    if ALARM_ENABLED:
+        from services.alarm.engine import AlarmEngine
+        alarm_engine = AlarmEngine()
+        alarm_engine.start()
+    else:
+        logging.info("🔕 ALARM_ENABLED=false，本次啟動不會啟動警報引擎。")
+
+    # 6. 🆕 心跳回報：讓網頁看得出採集服務本身是否還活著，以及各子系統的執行統計
+    loop_stats = {"cycle": 0, "last_cycle_seconds": None}
+    status_reporter = StatusReporter("collector")
+    status_reporter.register("protocols", lambda: {
+        "opcua": OPCUA_ENABLED, "modbus": MODBUS_ENABLED, "tia": TIA_ENABLED,
+        "mqtt": bool(mqtt_pub), "mqtt_include_opcua": MQTT_INCLUDE_OPCUA,
+        "alarm": bool(alarm_engine), "calc": bool(calc_engine), "poll_interval": POLL_INTERVAL,
+    })
+    status_reporter.register("writer", sensor_reading_writer.get_stats)
+    status_reporter.register("main_loop", lambda: dict(loop_stats))
+    if opcua_service:
+        from services.opcua_subscription_service import get_server_stats
+        status_reporter.register("opcua", get_server_stats)
+    if alarm_engine:
+        status_reporter.register("alarm", alarm_engine.get_stats)
+    if MODBUS_ENABLED and run_modbus_collector:
+        status_reporter.register("modbus", modbus_module.get_stats)
+    if TIA_ENABLED and run_tia_collector:
+        status_reporter.register("s7", s7_module.get_stats)
+    if calc_engine:
+        status_reporter.register("calc", calc_engine.get_stats)
+    status_reporter.register("reports", report_scheduler.get_stats)
+    status_reporter.start()
 
     if MODBUS_ENABLED or TIA_ENABLED:
         logging.info(f"⏱️ 當前設定採集週期: {POLL_INTERVAL} 秒 (套用於已啟用的 Modbus / TIA)")
@@ -217,6 +294,7 @@ def main():
 
             elapsed_time = time.time() - start_time
             sleep_time = max(0.0, POLL_INTERVAL - elapsed_time)
+            loop_stats.update(cycle=cycle_count, last_cycle_seconds=round(elapsed_time, 3))
 
             logging.info(f"⏱️ 本輪總耗時: {elapsed_time:.3f} 秒 | 預計休眠: {sleep_time:.3f} 秒")
 
@@ -227,8 +305,18 @@ def main():
     except Exception as main_err:
         logging.error(f"💥 主迴圈發生未預期的例外: {main_err}", exc_info=True)
     finally:
+        status_reporter.stop()
+        if alarm_engine:
+            alarm_engine.stop()
+        if calc_engine:
+            calc_engine.stop()
+        report_scheduler.stop()
         if opcua_service:
             opcua_service.stop()
+        if MODBUS_ENABLED and run_modbus_collector:
+            modbus_module.shutdown()
+        if TIA_ENABLED and run_tia_collector:
+            s7_module.shutdown()
         sensor_reading_writer.stop()
         if mqtt_pub:
             mqtt_pub.close()

@@ -45,6 +45,7 @@ from data_layer.batch_updater import (
     batch_update_opcua_values,
     set_opcua_bound_tags_state,
 )
+from data_layer import quality as Q
 from data_layer.timeseries_writer import sensor_reading_writer
 from protocols.opcua_protocol import connect_client, browse_recursive, OPCUAConnectionError
 from collector.run_opcua_collector import load_opcua_servers, update_server_status
@@ -135,6 +136,36 @@ RECONNECT_BASE_DELAY = 5.0
 RECONNECT_MAX_DELAY = 60.0
 SESSION_LIMIT_RETRY_DELAY = 120.0
 
+# 🆕 各 Server 的執行統計（server_id -> dict），由 services/status_reporter.py
+# 定期讀取後寫進 service_status，網頁「系統狀態」頁面顯示。
+# 只在本服務的 event loop 內寫入，讀取端只做淺複製，不需要加鎖。
+SERVER_STATS: dict = {}
+
+
+def _stats(server: dict) -> dict:
+    stats = SERVER_STATS.setdefault(server["id"], {
+        "server_name": server["server_name"],
+        "state": "CONNECTING",
+        "connected_since": None,
+        "monitored_items": 0,
+        "subscriptions": 0,
+        "bad_quality_items": 0,
+        "last_data_at": None,
+        "last_heartbeat_ok": None,
+        "reconnect_count": 0,
+        "last_error": None,
+    })
+    stats["server_name"] = server["server_name"]
+    return stats
+
+
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def get_server_stats() -> dict:
+    return {sid: dict(v) for sid, v in SERVER_STATS.items()}
+
 
 
 # ----------------------------------------------------------------
@@ -174,7 +205,12 @@ class _DataChangeHandler:
         quality = "GOOD"
         try:
             status = data.monitored_item.Value.StatusCode
-            quality = "GOOD" if status.is_good() else "BAD"
+            if status.is_good():
+                quality = "GOOD"
+            elif status.is_uncertain():
+                quality = "UNCERTAIN"
+            else:
+                quality = "BAD"
         except Exception as e:
             if not self._logged_quality_warning:
                 logger.warning(
@@ -360,7 +396,7 @@ def _build_node_deadband_map(cached_tags):
 # 配置 EURange 時，建議優先用 absolute。
 
 
-def _flush_to_db(server_id, pending, node_to_sensor):
+def _flush_to_db(server_id, pending, node_to_sensor, bad_nodes=None):
     rows = [
         (node_id, {"val": value}, quality, "ONLINE")
         for node_id, (value, quality) in pending.items()
@@ -371,9 +407,29 @@ def _flush_to_db(server_id, pending, node_to_sensor):
     # 實際寫入時機統一交給 SensorReadingWriter 背景執行緒依
     # SENSOR_READING_FLUSH_INTERVAL 週期處理（三協議共用同一套排程）。
     for node_id, (value, quality) in pending.items():
+        # 品質一併交給寫入排程（v3.1）：BAD 只記錄「轉為不良」那一筆，不算來源存活、
+        # 不參與警報判斷；UNCERTAIN 照常寫入但標記品質。
+        code = _QUALITY_CODES.get(quality, Q.BAD)
+        if bad_nodes is not None:
+            if code >= Q.BAD:
+                bad_nodes.add(node_id)
+            else:
+                bad_nodes.discard(node_id)
         sensor_id = node_to_sensor.get(node_id)
         if sensor_id is not None:
-            sensor_reading_writer.update_latest(sensor_id, value)
+            sensor_reading_writer.update_latest(sensor_id, value, quality=code)
+
+
+_QUALITY_CODES = {"GOOD": Q.GOOD, "UNCERTAIN": Q.UNCERTAIN, "BAD": Q.BAD}
+
+
+def _confirm_bound_sensors_alive(state: dict):
+    """心跳成功 = 連線與訂閱都正常，數值沒推播只是因為沒變化。"""
+    bad_nodes = state["bad_nodes"]
+    sensor_reading_writer.confirm_alive(
+        sid for node_id, sid in state["node_to_sensor"].items()
+        if sid is not None and node_id not in bad_nodes
+    )
 
 
 # ----------------------------------------------------------------
@@ -481,7 +537,13 @@ async def _flush_loop(buffer: _ChangeBuffer, server_id, server_name: str, state:
         pending = buffer.pop_all()
         if pending:
             try:
-                await asyncio.to_thread(_flush_to_db, server_id, pending, state["node_to_sensor"])
+                await asyncio.to_thread(
+                    _flush_to_db, server_id, pending, state["node_to_sensor"], state["bad_nodes"]
+                )
+                stats = SERVER_STATS.get(server_id)
+                if stats is not None:
+                    stats["last_data_at"] = _now_iso()
+                    stats["bad_quality_items"] = len(state["bad_nodes"])
             except Exception as e:
                 logger.error(
                     f"❌ [訂閱服務] Server [{server_name}] 更新即時值失敗: {e}",
@@ -590,7 +652,10 @@ async def _run_server_subscription(server: dict, stop_event: asyncio.Event):
             "node_deadband_map": {},
             "heartbeat_node_id": "i=2258",
             "handler": handler,
+            "bad_nodes": set(),
         }
+        stats = _stats(server)
+        stats["state"] = "CONNECTING"
         flush_task = None
         maintain_task = None
         session_limit_hit = False
@@ -638,6 +703,13 @@ async def _run_server_subscription(server: dict, stop_event: asyncio.Event):
             state["node_interval_map"] = node_interval_map
             state["node_deadband_map"] = node_deadband_map
             state["heartbeat_node_id"] = cached_tags[0]["node_id"]
+            stats.update(
+                state="ONLINE",
+                connected_since=_now_iso(),
+                monitored_items=len(handle_map),
+                subscriptions=len(subscriptions),
+                last_error=None,
+            )
 
             logger.info(
                 f"📡 [訂閱服務] Server [{server_name}] 訂閱建立完成，"
@@ -674,6 +746,10 @@ async def _run_server_subscription(server: dict, stop_event: asyncio.Event):
                         timeout=HEARTBEAT_READ_TIMEOUT,
                     )
                     consecutive_heartbeat_failures = 0
+                    _confirm_bound_sensors_alive(state)
+                    stats["last_heartbeat_ok"] = _now_iso()
+                    stats["monitored_items"] = len(state["handle_map"])
+                    stats["subscriptions"] = len(state["subscriptions"])
                 except Exception as heartbeat_err:
                     consecutive_heartbeat_failures += 1
                     if consecutive_heartbeat_failures < HEARTBEAT_MAX_FAILURES:
@@ -692,6 +768,11 @@ async def _run_server_subscription(server: dict, stop_event: asyncio.Event):
         except Exception as e:
             error_str = str(e)
             logger.error(f"❌ [訂閱服務] Server [{server_name}] 連線/訂閱發生例外: {e}")
+            stats.update(
+                state="OFFLINE",
+                last_error=error_str[:300],
+                reconnect_count=stats["reconnect_count"] + 1,
+            )
             await asyncio.to_thread(update_server_status, server_id, "OFFLINE", error_str)
             # 🔧 同步把「已綁定」的點位標記為 OFFLINE。
             # 原本只更新 opcua_servers.conn_state，opcua_tags.plc_state 會永遠
@@ -699,6 +780,10 @@ async def _run_server_subscription(server: dict, stop_event: asyncio.Event):
             # 斷線。未綁定的點位不動（它們本來就不會被訂閱更新，標成 OFFLINE
             # 只會塞爆異常清單）。
             await asyncio.to_thread(set_opcua_bound_tags_state, server_id, "OFFLINE")
+            # 🆕 斷線期間不要讓心跳用舊值補寫、也不要用舊值判斷數值警報
+            sensor_reading_writer.mark_unavailable(
+                sid for sid in state["node_to_sensor"].values() if sid is not None
+            )
             session_limit_hit = "TooManySessions" in error_str
 
         finally:
@@ -713,7 +798,9 @@ async def _run_server_subscription(server: dict, stop_event: asyncio.Event):
             pending = buffer.pop_all()
             if pending:
                 try:
-                    await asyncio.to_thread(_flush_to_db, server_id, pending, state["node_to_sensor"])
+                    await asyncio.to_thread(
+                        _flush_to_db, server_id, pending, state["node_to_sensor"], state["bad_nodes"]
+                    )
                 except Exception as e:
                     logger.error(
                         f"❌ [訂閱服務] Server [{server_name}] 斷線前補寫緩衝區資料失敗: {e}"
@@ -815,6 +902,7 @@ async def _service_main(stop_signal: threading.Event):
             task, server = running.pop(sid)
             logger.info(f"🛑 [訂閱服務] Server [{server['server_name']}] 已被刪除或停用，停止監控")
             await _cancel_task(task)
+            SERVER_STATS.pop(sid, None)
 
         await asyncio.sleep(SERVER_LIST_REFRESH_INTERVAL)
 

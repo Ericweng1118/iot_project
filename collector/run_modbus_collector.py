@@ -1,326 +1,368 @@
-import logging
-import sys
-import struct
+"""
+collector/run_modbus_collector.py
+=================================
+Modbus 採集（由 main.py 每 POLL_INTERVAL 秒呼叫一次 main()）。
+
+🆕 v3.1 改寫重點（相較 v2）：
+    1. 批次讀取：同站號、同功能碼、位址相近的點位合併成一次請求（collector/modbus_blocks.py），
+       50 個點從 50 次請求降到 1~3 次
+    2. 連線重用：連線跨輪次保留，不再每輪 connect / disconnect
+    3. 依「實體連線」分組：同一個閘道（IP:Port）後面的多個站號共用一條連線、依序讀取。
+       v2 是每個 (IP, Port, 站號) 各開一條連線同時連，很多 RS-485 閘道只允許 1~4 條連線，
+       站號一多就互相搶、隨機失敗
+    4. 傳輸方式：Modbus TCP / RTU over TCP / RTU 序列埠（sql/015 的 transport 欄位）
+    5. 自動避開壞點位：整塊讀取被設備拒絕（例如某個位址不存在）時改逐點讀取，
+       找出有問題的點位後讓它單獨讀，不再拖累其他點位；若逐點都成功，代表是空隙裡的
+       未定義暫存器造成，該組改成只合併連續位址
+    6. 一個站號逾時，同一條連線上的其他站號照樣讀；連線本身斷掉才整條標記離線
+    7. 品質：讀不到的點位通知寫入排程「來源斷線」（通訊中斷標記、停止心跳補寫）
+    8. 不再自行 flush sensor_readings（交給 main.py 的統一寫入排程）；每個點位的 log 改成 DEBUG，
+       每輪只印一行摘要
+    9. 讀取失敗時保留最後一次的數值，只更新連線狀態（與 OPC UA 行為一致）
+
+可調參數（.env）：
+    MODBUS_TIMEOUT=3             單次請求逾時（秒）
+    MODBUS_RETRIES=1             逾時重試次數（離線設備越多次越拖慢整輪）
+    MODBUS_MAX_BLOCK_REGISTERS=100   一次讀取的暫存器上限（部分設備只接受 32 / 64，可調小）
+    MODBUS_MAX_GAP=10            兩個點位相隔多少暫存器以內才合併
+    MODBUS_MAX_WORKERS=8         同時採集的實體連線數上限
+"""
+
 import json
-from datetime import datetime
+import logging
+import os
+import sys
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
+from psycopg2.extras import execute_values
+
+from collector.modbus_blocks import plan_blocks
 from data_layer.db_connector import DatabaseConnector
 from data_layer.timeseries_writer import sensor_reading_writer
-from protocols.modbus_protocol import ModbusTCPCollector
+from protocols.modbus_codec import BIT_FUNCTIONS, apply_linear_scaling, decode, register_count
+from protocols.modbus_protocol import ModbusConnection
 
-# 配置 日誌
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
 logger = logging.getLogger(__name__)
 
-# 併發連線的最大執行緒數上限（同時連線的設備台數上限，避免瞬間開太多 socket）
-MAX_WORKERS = 8
 
-# ----------------------------------------------------
-# 🔍 核心工具 1：依據 data_type 自動判定所需的暫存器數量
-# ----------------------------------------------------
-def get_register_count(data_type: str) -> int:
-    dt = str(data_type).lower().strip()
-    if dt in ('bool', 'word', 'int', 'int16', 'uint16'):
-        return 1
-    elif dt in ('dint', 'uint32', 'float', 'float32', 'int32'):
-        return 2
-    elif dt in ('int64', 'uint64', 'float64', 'double'):
-        return 4
-    return 1
-
-# ----------------------------------------------------
-# 🔍 核心工具 2：處理 Byte Order 與 Word Order 解碼
-# ----------------------------------------------------
-def parse_registers(registers, data_type: str, byte_order: str = 'BIG', word_order: str = 'BIG'):
-    if not registers:
-        return None
-
-    dt = str(data_type).lower().strip()
-
-    # 若為布林值 (Coils / Discrete Inputs)
-    if dt == 'bool' and isinstance(registers[0], bool):
-        return 1.0 if registers[0] else 0.0
-
-    # 1. Word Order 翻轉 (LITTLE 代表 Word Swap，如 CD AB 順序)
-    if word_order and str(word_order).upper() == 'LITTLE':
-        registers = registers[::-1]
-
-    # 2. Byte Order 重組 (LITTLE 代表 小端序 Byte 對調)
-    raw_bytes = bytearray()
-    for r in registers:
-        if byte_order and str(byte_order).upper() == 'LITTLE':
-            raw_bytes.extend(struct.pack('<H', r))
-        else:
-            raw_bytes.extend(struct.pack('>H', r))
-
-    # 3. 依據資料型態 unpack
+def _env_num(key, default):
     try:
-        if dt == 'bool':
-            return float(struct.unpack('>H', raw_bytes)[0] != 0)
-        elif dt in ('word', 'uint16'):
-            return float(struct.unpack('>H', raw_bytes)[0])
-        elif dt in ('int', 'int16'):
-            return float(struct.unpack('>h', raw_bytes)[0])
-        elif dt in ('dint', 'int32'):
-            return float(struct.unpack('>i', raw_bytes)[0])
-        elif dt == 'uint32':
-            return float(struct.unpack('>I', raw_bytes)[0])
-        elif dt in ('float', 'float32'):
-            return float(struct.unpack('>f', raw_bytes)[0])
-        elif dt == 'int64':
-            return float(struct.unpack('>q', raw_bytes)[0])
-        elif dt == 'uint64':
-            return float(struct.unpack('>Q', raw_bytes)[0])
-        elif dt in ('float64', 'double'):
-            return float(struct.unpack('>d', raw_bytes)[0])
-        else:
-            logger.warning(f"未知的 data_type: {data_type}")
-            return None
-    except Exception as e:
-        logger.error(f"暫存器數值解碼失敗 ({data_type}): {e}")
-        return None
+        return float(os.getenv(key, str(default)).split("#")[0].strip())
+    except ValueError:
+        return default
+
+
+TIMEOUT = _env_num("MODBUS_TIMEOUT", 3.0)
+RETRIES = int(_env_num("MODBUS_RETRIES", 1))
+MAX_BLOCK_REGISTERS = int(_env_num("MODBUS_MAX_BLOCK_REGISTERS", 100))
+MAX_GAP = int(_env_num("MODBUS_MAX_GAP", 10))
+MAX_WORKERS = int(_env_num("MODBUS_MAX_WORKERS", 8))
+
+# 跨輪次保留的狀態（main.py 每輪呼叫 main()，模組常駐在記憶體裡）
+_CONNECTIONS: dict = {}            # 連線 key -> ModbusConnection
+_ISOLATED_TAGS: set = set()        # 需要單獨讀取的點位 id
+_STRICT_GROUPS: dict = defaultdict(set)   # 連線 key -> {(slave, fc)} 只合併連續位址
+MODBUS_STATS: dict = {}            # 連線標籤 -> 統計（services/status_reporter.py 回報）
+_WARNED: dict = {}                 # 問題 key -> 訊息：同一個問題只在第一次發生 / 內容改變時印 WARNING
+
+
+def _warn(key, message):
+    """同一個問題每輪都會再發生一次（例如設備離線），只在狀態改變時印 WARNING，避免洗版。"""
+    if _WARNED.get(key) != message:
+        logger.warning(message)
+        _WARNED[key] = message
+    else:
+        logger.debug(message)
+
+
+def _recovered(key, message):
+    if _WARNED.pop(key, None) is not None:
+        logger.info(message)
+
+# 向下相容：v2 曾經從這裡 import 這幾個工具函式
+get_register_count = register_count
+parse_registers = decode
+
 
 # ----------------------------------------------------
-# 🔍 核心工具 3：線性 Scaling 工程值轉換
+# 讀取點位設定（sql/015 之前沒有 transport / serial_settings / enabled 欄位）
 # ----------------------------------------------------
-def apply_linear_scaling(val, raw_min, raw_max, eng_min, eng_max):
-    if val is None:
-        return None
-    if None in (raw_min, raw_max, eng_min, eng_max):
-        return val
-    if raw_max == raw_min:
-        return val
-    
-    val = max(min(val, raw_max), raw_min)
-    return ((val - raw_min) / (raw_max - raw_min)) * (eng_max - eng_min) + eng_min
+_BASE_COLUMNS = """id, name, plc_ip, plc_port, slave_id, function_code,
+                   start_address, data_type, raw_min, raw_max, eng_min, eng_max,
+                   byte_order, word_order, state_dictionary, sensor_id"""
 
-# ----------------------------------------------------
-# 🗄️ 資料庫讀取：撈取 modbus_scada 所有點位設定
-# ----------------------------------------------------
+
 def fetch_scada_tags():
-    sql = """
-        SELECT id, name, plc_ip, plc_port, slave_id, function_code, 
-               start_address, data_type, raw_min, raw_max, eng_min, eng_max,
-               byte_order, word_order, state_dictionary, sensor_id
-        FROM modbus_scada;
-    """
-    try:
-        # 使用 with 語法，離開區塊時自動釋放連線
-        with DatabaseConnector.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(sql)
-                columns = [desc[0] for desc in cursor.description]
-                return [dict(zip(columns, row)) for row in cursor.fetchall()]
-    except Exception as e:
-        logger.error(f"從 modbus_scada 資料表讀取點位失敗: {e}")
-        return []
-
-
-# ----------------------------------------------------
-# 🗄️ 資料庫寫入：將採集數據寫回 modbus_scada
-# ----------------------------------------------------
-def update_scada_results(results):
-    if not results:
-        return
-
-    sql = """
-        UPDATE modbus_scada
-        SET current_value = %s,
-            current_data = %s,
-            plc_state = %s,
-            last_update = %s
-        WHERE id = %s;
-    """
-    try:
-        # 使用 with 語法，離開區塊時自動釋放連線與 handle commit
-        with DatabaseConnector.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.executemany(sql, results)
-                conn.commit()
-                logger.info(f"💾 成功回寫 {len(results)} 筆點位數據至 modbus_scada！")
-    except Exception as e:
-        logger.error(f"寫入 modbus_scada 失敗: {e}")
-
-
-# ----------------------------------------------------
-# 🚀 單一設備採集邏輯（在獨立執行緒中執行）
-# ----------------------------------------------------
-def _collect_one_device(plc_ip, plc_port, slave_id, device_tags, now):
-    """
-    處理單一台設備 (plc_ip, plc_port, slave_id) 底下所有點位的採集。
-    回傳這台設備產生的 results 清單，供最後統一批次寫入資料庫。
-    這台設備連線逾時或失敗，只會拖慢自己這條執行緒，不影響其他設備。
-    """
-    results = []
-    collector = ModbusTCPCollector(host=plc_ip, port=plc_port, slave_id=slave_id)
-
-    # 連線失敗：該設備下所有點位自動標註為 OFFLINE
-    if not collector.connect():
-        logger.error(
-            f"❌ 無法連線至 PLC [{plc_ip}:{plc_port}] (Slave ID={slave_id})"
-        )
-        for tag in device_tags:
-            results.append((None, None, "OFFLINE", now, tag["id"]))
-        return results
-
-    # 連線成功：開始依 function_code 讀取暫存器
-    for tag in device_tags:
-        fc = tag["function_code"]
-        addr = tag["start_address"]
-        dt = tag["data_type"]
-        count = get_register_count(dt)
-
-        regs = None
+    queries = (
+        f"SELECT {_BASE_COLUMNS}, transport, serial_settings FROM modbus_scada WHERE enabled;",
+        f"SELECT {_BASE_COLUMNS}, 'tcp' AS transport, NULL AS serial_settings FROM modbus_scada;",
+    )
+    last_error = None
+    for sql in queries:
         try:
-            if fc == 1:
-                regs = collector.read_coils(address=addr, count=1)
-            elif fc == 2:
-                regs = collector.read_discrete_inputs(
-                    address=addr, count=1
-                )
-            elif fc == 3:
-                regs = collector.read_holding_registers(
-                    address=addr, count=count
-                )
-            elif fc == 4:
-                regs = collector.read_input_registers(
-                    address=addr, count=count
-                )
+            with DatabaseConnector.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql)
+                    columns = [desc[0] for desc in cursor.description]
+                    tags = [dict(zip(columns, row)) for row in cursor.fetchall()]
+            _LAST_TAGS[:] = tags
+            _recovered("fetch", "✅ modbus_scada 恢復讀取")
+            return tags
         except Exception as e:
-            logger.error(f"讀取點位 [{tag['name']}] 失敗: {e}")
+            last_error = e
+    # 資料庫暫時連不上：沿用上一次成功讀到的點位設定繼續採集，採到的資料由寫入排程
+    # 存進本機緩存，資料庫恢復後補寫（不這樣做的話，斷線期間 Modbus 資料會全部遺失）
+    if _LAST_TAGS:
+        _warn("fetch", f"⚠️ 讀取 modbus_scada 失敗，沿用上次的 {len(_LAST_TAGS)} 個點位設定繼續採集: {last_error}")
+        return list(_LAST_TAGS)
+    logger.error(f"從 modbus_scada 資料表讀取點位失敗: {last_error}")
+    return []
 
-        if regs is not None:
-            # 1. 解碼暫存器原始數值
-            raw_val = parse_registers(
-                regs, dt, tag["byte_order"], tag["word_order"]
-            )
 
-            # 2. 進行工程 Scaling 計算
-            final_val = apply_linear_scaling(
-                raw_val,
-                tag["raw_min"],
-                tag["raw_max"],
-                tag["eng_min"],
-                tag["eng_max"],
-            )
+_LAST_TAGS: list = []
 
-            if final_val is not None:
-                rounded_val = round(final_val, 4)
-                val_for_payload = rounded_val
 
-                # 3. 狀態字典 Mapping：若匹配成功，直接將 val 替換為狀態文字
-                state_dict = tag["state_dictionary"]
-                if state_dict and isinstance(state_dict, dict):
-                    str_key = (
-                        str(int(final_val))
-                        if hasattr(final_val, "is_integer")
-                        and final_val.is_integer()
-                        else str(final_val)
-                    )
-                    if str_key in state_dict:
-                        val_for_payload = state_dict[
-                            str_key
-                        ]  # 直接覆蓋為文字
+def connection_key(tag) -> tuple:
+    transport = (tag.get("transport") or "tcp").lower()
+    if transport == "rtu":
+        return ("rtu", tag["plc_ip"], 0, tag.get("serial_settings") or "9600,8,N,1")
+    return (transport, tag["plc_ip"], int(tag.get("plc_port") or 502), None)
 
-                # 4. 封裝 JSON Payload (val 直接為數字或轉換後的文字)
-                current_data_payload = {"val": val_for_payload}
 
-                logger.info(
-                    f"   └─ 📊 [{tag['name']}] (ID:{tag['id']}) ="
-                    f" {final_val} | JSON: {current_data_payload}"
-                )
+def _get_connection(key) -> ModbusConnection:
+    conn = _CONNECTIONS.get(key)
+    if conn is None:
+        transport, host, port, serial = key
+        conn = ModbusConnection(transport, host, port, timeout=TIMEOUT, serial_settings=serial,
+                                retries=RETRIES)
+        _CONNECTIONS[key] = conn
+    return conn
 
-                # 5. 若此點位已綁定感測器，把「原始數值」(rounded_val) 送進
-                #    時序寫入器暫存；stage() 內部會依規則判斷是否真的要寫入
-                #    （首次出現 / 數值變化 / 心跳補寫），這裡不用自己判斷。
-                sensor_reading_writer.stage(tag.get("sensor_id"), rounded_val, now)
 
-                results.append((
-                    rounded_val,  # 數值欄位 (current_value) 依然保留原始數字供數據分析
-                    json.dumps(
-                        current_data_payload, ensure_ascii=False
-                    ),  # ensure_ascii=False 避免中文變成 unicode 碼
-                    "ONLINE",
-                    now,
-                    tag["id"],
-                ))
+# ----------------------------------------------------
+# 數值處理
+# ----------------------------------------------------
+def _to_engineering(tag, registers):
+    raw = decode(registers, tag["data_type"], tag.get("byte_order") or "BIG", tag.get("word_order") or "BIG")
+    return apply_linear_scaling(raw, tag["raw_min"], tag["raw_max"], tag["eng_min"], tag["eng_max"])
+
+
+def _payload(tag, value):
+    """狀態字典對應成功時，current_data 放文字（例如「大火燃燒」），current_value 仍是數字。"""
+    state_dict = tag.get("state_dictionary")
+    if isinstance(state_dict, str):
+        try:
+            state_dict = json.loads(state_dict)
+        except ValueError:
+            state_dict = None
+    if state_dict and isinstance(state_dict, dict):
+        key = str(int(value)) if float(value).is_integer() else str(value)
+        if key in state_dict:
+            return {"val": state_dict[key]}
+    return {"val": value}
+
+
+def _ok_row(tag, value, now):
+    rounded = round(value, 4)
+    sensor_reading_writer.update_latest(tag.get("sensor_id"), rounded, now)
+    logger.debug(f"   └─ 📊 [{tag['name']}] (ID:{tag['id']}) = {rounded}")
+    return (rounded, json.dumps(_payload(tag, rounded), ensure_ascii=False), "ONLINE", now, tag["id"])
+
+
+def _fail_rows(tags, state, now):
+    sensor_reading_writer.mark_unavailable(t.get("sensor_id") for t in tags)
+    return [(None, None, state, now, t["id"]) for t in tags]
+
+
+# ----------------------------------------------------
+# 單一實體連線的採集（在獨立執行緒中執行）
+# ----------------------------------------------------
+def _collect_connection(key, tags):
+    conn = _get_connection(key)
+    started = time.perf_counter()
+    stats = {"label": conn.label, "transport": key[0], "tags": len(tags), "requests": 0,
+             "errors": 0, "blocks": 0, "last_error": None}
+    results = []
+    blocks = plan_blocks(tags, max_registers=MAX_BLOCK_REGISTERS, max_gap=MAX_GAP,
+                         isolate=_ISOLATED_TAGS, strict_groups=_STRICT_GROUPS[key])
+    stats["blocks"] = len(blocks)
+    silent_slaves = set()
+    connection_down = False
+
+    for block in blocks:
+        block_tags = [t for t, _ in block.items]
+        now = datetime.now().astimezone()
+        if connection_down:
+            results += _fail_rows(block_tags, "OFFLINE", now)
+            continue
+        if block.slave in silent_slaves:
+            results += _fail_rows(block_tags, "OFFLINE", now)
+            continue
+
+        res = conn.read(block.function_code, block.start, block.count, block.slave)
+        stats["requests"] += 1
+        now = datetime.now().astimezone()
+
+        if res.ok:
+            _recovered(("conn", key), f"✅ Modbus {conn.label} 連線恢復")
+            _recovered(("slave", key, block.slave), f"✅ Modbus {conn.label} 站號 {block.slave} 恢復回應")
+            for tag, _ in block.items:
+                _recovered(("tag", tag["id"]), f"✅ Modbus 點位 [{tag['name']}] 恢復正常")
+            for tag, offset in block.items:
+                span = 1 if block.function_code in BIT_FUNCTIONS else register_count(tag["data_type"])
+                value = _to_engineering(tag, res.values[offset:offset + span])
+                results.append(_ok_row(tag, value, now) if value is not None
+                               else _fail_rows([tag], "ERROR", now)[0])
+            continue
+
+        stats["errors"] += 1
+        stats["last_error"] = res.error
+        if res.fatal:
+            _warn(("conn", key), f"❌ Modbus {conn.label} 連線失敗：{res.error}")
+            connection_down = True
+            results += _fail_rows(block_tags, "OFFLINE", now)
+            continue
+        if res.exception_code is None:
+            # 逾時：這個站號沒回應，同一條連線上的其他站號照樣讀
+            _warn(("slave", key, block.slave), f"⚠️ Modbus {conn.label} 站號 {block.slave} 無回應：{res.error}")
+            silent_slaves.add(block.slave)
+            results += _fail_rows(block_tags, "OFFLINE", now)
+            continue
+
+        # 設備有回應但拒絕這個請求（例如位址不存在）
+        if len(block.items) == 1:
+            tag = block_tags[0]
+            _ISOLATED_TAGS.add(tag["id"])
+            _warn(("tag", tag["id"]), f"⚠️ Modbus 點位 [{tag['name']}] 讀取被拒絕：{res.error}")
+            results += _fail_rows([tag], "ERROR", now)
+            continue
+
+        logger.warning(
+            f"⚠️ Modbus {conn.label} 站號 {block.slave} FC{block.function_code:02d} "
+            f"位址 {block.start}~{block.start + block.count - 1} 整塊讀取被拒絕（{res.error}），改逐點讀取"
+        )
+        all_ok = True
+        for tag in block_tags:
+            span = 1 if block.function_code in BIT_FUNCTIONS else register_count(tag["data_type"])
+            single = conn.read(block.function_code, int(tag["start_address"]), span, block.slave)
+            stats["requests"] += 1
+            now = datetime.now().astimezone()
+            value = _to_engineering(tag, single.values) if single.ok else None
+            if value is not None:
+                results.append(_ok_row(tag, value, now))
             else:
-                results.append(
-                    (None, None, "ERROR", now, tag["id"])
-                )
-        else:
-            results.append((None, None, "ERROR", now, tag["id"]))
+                all_ok = False
+                _ISOLATED_TAGS.add(tag["id"])
+                logger.warning(f"   └─ 點位 [{tag['name']}] 讀取失敗：{single.error}，之後單獨讀取")
+                results += _fail_rows([tag], "ERROR", now)
+        if all_ok:
+            _STRICT_GROUPS[key].add((block.slave, block.function_code))
+            logger.warning(
+                f"   └─ 逐點讀取全部成功，代表是點位之間未定義的暫存器造成；"
+                f"站號 {block.slave} FC{block.function_code:02d} 之後只合併連續位址"
+            )
 
-    collector.disconnect()
+    ok_count = sum(1 for r in results if r[2] == "ONLINE")
+    stats.update(
+        ok_tags=ok_count,
+        state="ONLINE" if ok_count == len(tags) else ("OFFLINE" if ok_count == 0 else "PARTIAL"),
+        last_cycle_ms=round((time.perf_counter() - started) * 1000, 1),
+        isolated_tags=len([t for t in tags if t["id"] in _ISOLATED_TAGS]),
+        strict_groups=sorted(_STRICT_GROUPS[key]),
+        last_poll_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+    )
+    MODBUS_STATS[conn.label] = stats
     return results
 
 
 # ----------------------------------------------------
-# 🚀 主程式執行邏輯（多台設備併發版本）
+# 資料庫寫入：將採集結果寫回 modbus_scada
+# ----------------------------------------------------
+def update_scada_results(results):
+    if not results:
+        return
+    sql = """
+        UPDATE modbus_scada AS m
+        SET current_value = COALESCE(v.cv, m.current_value),
+            current_data  = COALESCE(v.cd, m.current_data),
+            plc_state     = v.st,
+            last_update   = CASE WHEN v.st = 'ONLINE' THEN v.ts ELSE m.last_update END
+        FROM (VALUES %s) AS v(cv, cd, st, ts, id)
+        WHERE m.id = v.id;
+    """
+    try:
+        with DatabaseConnector.get_connection() as conn:
+            with conn.cursor() as cursor:
+                execute_values(cursor, sql, results,
+                               template="(%s::real, %s::jsonb, %s, %s::timestamptz, %s::bigint)")
+        _recovered("update", "✅ modbus_scada 恢復寫入")
+    except Exception as e:
+        _warn("update", f"⚠️ 寫入 modbus_scada 即時值失敗（資料庫恢復後自動更新）: {e}")
+
+
+# ----------------------------------------------------
+# 一輪採集（main.py 每 POLL_INTERVAL 秒呼叫一次）
 # ----------------------------------------------------
 def main():
-    if not DatabaseConnector.initialize_pool():
-        logger.error("PostgreSQL 連線池初始化失敗，採集程序終止。")
+    if not DatabaseConnector.initialize_pool() and not _LAST_TAGS:
+        logger.error("PostgreSQL 連線池初始化失敗，本輪 Modbus 採集略過。")
         return
-
-    print("\n🚀 [Modbus SCADA 動態採集服務] 啟動中...")
 
     tags = fetch_scada_tags()
     if not tags:
-        logger.warning("modbus_scada 資料表中沒有找到任何點位設定。")
+        logger.info("modbus_scada 沒有啟用中的點位。")
         return
 
+    grouped = defaultdict(list)
+    for tag in tags:
+        grouped[connection_key(tag)].append(tag)
+
+    # 設定被刪除 / 改位址的連線：關閉並移除
+    for key in list(_CONNECTIONS):
+        if key not in grouped:
+            removed = _CONNECTIONS.pop(key)
+            MODBUS_STATS.pop(removed.label, None)
+            removed.close()
+
+    started = time.perf_counter()
+    results = []
+    worker_count = min(MAX_WORKERS, len(grouped)) or 1
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="modbus") as executor:
+        futures = {executor.submit(_collect_connection, key, group): key for key, group in grouped.items()}
+        for future in as_completed(futures):
+            try:
+                results.extend(future.result())
+            except Exception as e:
+                logger.error(f"Modbus 連線 {futures[future]} 採集執行緒發生未預期例外: {e}", exc_info=True)
+
+    update_scada_results(results)
+    ok = sum(1 for r in results if r[2] == "ONLINE")
+    labels = {_CONNECTIONS[k].label for k in grouped}
+    requests = sum(s["requests"] for label, s in MODBUS_STATS.items() if label in labels)
     logger.info(
-        f"📋 成功載入 {len(tags)} 個 SCADA"
-        " 點位，準備按 IP/Port/Slave 分組併發連線..."
+        f"🏁 Modbus 本輪：{len(grouped)} 條連線、{len(tags)} 個點位（成功 {ok}）、"
+        f"{requests} 次請求，耗時 {(time.perf_counter() - started) * 1000:.0f} ms"
     )
 
-    # 按 (plc_ip, plc_port, slave_id) 分組，減少重複開啟建立 Socket 的開銷
-    grouped_tags = defaultdict(list)
-    for tag in tags:
-        key = (tag["plc_ip"], tag["plc_port"] or 502, tag["slave_id"] or 1)
-        grouped_tags[key].append(tag)
 
-    results_to_update = []
-    now = datetime.now().astimezone()
+def get_stats() -> dict:
+    return {label: dict(s) for label, s in MODBUS_STATS.items()}
 
-    # 併發連線多台設備：每台設備各自跑在獨立執行緒，
-    # 某一台離線卡在 connect timeout 不會拖到其他台的採集
-    worker_count = min(MAX_WORKERS, len(grouped_tags)) or 1
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_to_key = {
-            executor.submit(
-                _collect_one_device, plc_ip, plc_port, slave_id, device_tags, now
-            ): (plc_ip, plc_port, slave_id)
-            for (plc_ip, plc_port, slave_id), device_tags in grouped_tags.items()
-        }
 
-        for future in as_completed(future_to_key):
-            key = future_to_key[future]
-            try:
-                results_to_update.extend(future.result())
-            except Exception as e:
-                logger.error(f"設備 {key} 採集執行緒發生未預期例外: {e}", exc_info=True)
+def shutdown():
+    for conn in _CONNECTIONS.values():
+        conn.close()
+    _CONNECTIONS.clear()
 
-    # 批次更新回資料庫
-    update_scada_results(results_to_update)
-
-    # 把這一輪暫存的感測器數值批次寫進 sensor_readings 時序表
-    # （不管是被 main.py 呼叫，或單獨執行本檔案測試，都會在這裡自行 flush，
-    #  確保時序資料不會漏寫）
-    sensor_reading_writer.flush()
-    logger.info("🏁 本輪 Modbus SCADA 數據採集與更新完畢。\n")
 
 if __name__ == "__main__":
-    # 獨立執行本檔案時（不透過 main.py 排程），先載入時序寫入器的初始快取，
-    # 確保心跳補寫的時間判斷是接續資料庫裡既有的資料，不會從頭算。
-    # （透過 main.py 啟動時，這個快取只在 main.py 啟動當下載入一次即可，
-    #  不需要也不應該每輪都重載，所以特意放在這裡而不是 main() 內部。）
+    # 獨立執行本檔案（不透過 main.py）：跑一輪並立即寫入 sensor_readings
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
+                        handlers=[logging.StreamHandler(sys.stdout)])
     sensor_reading_writer.load_initial_cache()
     main()
+    sensor_reading_writer.flush()
+    shutdown()

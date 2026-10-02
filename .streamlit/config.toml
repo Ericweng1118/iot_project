@@ -1,0 +1,12 @@
+# Streamlit 設定（admin_app.py 啟動時自動讀取）
+
+[client]
+# 隱藏右上角給開發者用的 Deploy / Rerun 等選單，現場操作人員用不到
+toolbarMode = "viewer"
+
+[server]
+# 檔案異動不自動重跑（正式環境），開發時可改成 true
+runOnSave = false
+
+[browser]
+gatherUsageStats = false

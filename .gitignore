@@ -23,3 +23,7 @@ ENV/
 .vscode/
 .idea/
 .DS_Store
+
+# ===== 執行期資料（本機緩存、憑證）=====
+data/
+certs/

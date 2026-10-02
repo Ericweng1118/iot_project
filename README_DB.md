@@ -250,23 +250,76 @@ SELECT 'opcua', id, node_id FROM opcua_tags WHERE sensor_id IS NULL;
 
 ---
 
+## 🆕 v3 新增資料表（`sql/011`、`sql/012`）
+
+### `alarm_rules`：警報規則
+
+| 欄位 | 型態 | 說明 |
+| --- | --- | --- |
+| `rule_id` | SERIAL PK | |
+| `sensor_id` | INTEGER FK → sensors（ON DELETE CASCADE） | |
+| `alarm_type` | VARCHAR(4) | `HH` / `H` / `L` / `LL` / `EQ` / `NE` |
+| `setpoint` | NUMERIC | 設定值 |
+| `deadband` | NUMERIC ≥ 0 | 遲滯：H 類要降到 setpoint − deadband 才恢復，L 類反之 |
+| `on_delay_sec` | INTEGER ≥ 0 | 條件連續成立多少秒才觸發 |
+| `priority` | SMALLINT 1~4 | 1 緊急 / 2 高 / 3 中 / 4 低 |
+| `message` | VARCHAR(200) | 附加訊息（處置方式等） |
+| `enabled` | BOOLEAN | |
+
+`sensors.min_threshold` / `max_threshold` 另外會被警報引擎視為隱含的 L / H 規則，不存在這張表。
+
+### `alarm_events`：警報事件
+
+| 欄位 | 說明 |
+| --- | --- |
+| `alarm_key` | 警報來源識別：`rule:<rule_id>`、`limit:<sensor_id>:H`、`server:<id>:offline`、`plc:<table>:<ip>:offline` |
+| `source_type` | `sensor_rule` / `sensor_limit` / `server_offline` / `device_offline` |
+| `raised_at` / `cleared_at` | 發生 / 恢復時間；`cleared_at IS NULL` = 仍在發生 |
+| `acked_at` / `acked_by` / `ack_comment` | 確認紀錄 |
+| `trigger_value` / `setpoint` / `clear_value` | 觸發值、設定值、恢復時的值 |
+
+部分唯一索引 `uq_alarm_events_active_key (alarm_key) WHERE cleared_at IS NULL` 確保同一來源同時只有一筆發生中。
+「目前警報」= `cleared_at IS NULL OR acked_at IS NULL`。
+
+### `app_users` / `audit_log` / `service_status`
+
+| 表 | 重點欄位 |
+| --- | --- |
+| `app_users` | `username` PK、`password_hash`（`pbkdf2_sha256$迭代$salt$hash`）、`role`（viewer/operator/engineer/admin）、`enabled`、`last_login` |
+| `audit_log` | `ts`、`username`、`action`（如 `sensor.update`、`alarm.ack`、`login.failed`）、`target`、`detail` JSONB（欄位舊值 → 新值） |
+| `service_status` | `service_name` PK（`collector`）、`last_heartbeat`、`started_at`、`info` JSONB（寫入排程 / OPC UA / 警報引擎統計） |
+
+### 🆕 v3.1 新增欄位（`sql/014`、`sql/015`）
+
+| 欄位 | 說明 |
+| --- | --- |
+| `sensor_readings.quality` SMALLINT | 0 正常｜1 保持值（數值沒變、心跳補寫）｜2 不確定｜3 品質不良（只記錄轉為不良的那一筆）｜4 通訊中斷（斷線時記一筆，數值沿用最後值）｜NULL 舊資料（視為正常）。**統計時請排除 3 / 4**：`WHERE quality IS NULL OR quality < 3` |
+| `modbus_scada.transport` | `tcp` / `rtu_over_tcp` / `rtu`（`rtu` 時 `plc_ip` 填序列埠路徑） |
+| `modbus_scada.serial_settings` | `transport=rtu` 時的「鮑率,資料位元,同位,停止位元」，例如 `9600,8,N,1` |
+| `modbus_scada.enabled` | FALSE = 暫停採集（保留設定） |
+
+### 🆕 v3.2 新增資料表（`sql/016` ~ `sql/018`）
+
+| 表 | 重點欄位 |
+| --- | --- |
+| `device_templates` | `name`（唯一）、`protocol`（none / modbus / opcua）、`definition` JSONB（感測器、點位、警報規則，格式見 `data_layer/templates.py`） |
+| `calculated_points` | `sensor_id`（唯一，結果感測器）、`expression`、`enabled`；`current_value` / `state`（ONLINE / OFFLINE / ERROR）/ `last_error` 由計算引擎回寫 |
+| `report_schedules` | `frequency`（daily / weekly / monthly）、`send_time`、`weekday`、`day_of_month`、`metrics[]`、`device_codes[]`、`sensor_codes[]`、`recipients[]`、`last_run_at` / `last_status` |
+
+---
+
 ## 🛠️ 維運建議
 
 ### 資料壓縮（選用，資料量成長後再啟用）
 
-```sql
-ALTER TABLE sensor_readings SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'sensor_id'
-);
+已整理成 [`sql/013_timeseries_policy.sql`](sql/013_timeseries_policy.sql)（idempotent、只壓縮不刪資料、
+可用 `-v compress_after="'14 days'"` 調整門檻）。啟用後網頁「系統狀態」會顯示政策。
 
-SELECT add_compression_policy('sensor_readings', INTERVAL '30 days');
-```
-
-### 資料保留策略（選用）
+### 資料保留策略（選用，不可逆）
 
 ```sql
-SELECT add_retention_policy('sensor_readings', INTERVAL '1 year');
+-- 確認保留年限後才執行，超過的資料會永久刪除
+SELECT add_retention_policy('sensor_readings', INTERVAL '3 years', if_not_exists => true);
 ```
 
 ### 定期確認 hypertable 分區狀況
