@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from data_layer.sensor_codes import allocate_sensor_codes, next_code
 from protocols import s7_codec
 from protocols.modbus_codec import DATA_TYPES, normalize_type
 
@@ -75,6 +76,20 @@ def p_int(v, required=False, lo=None, hi=None):
     if lo is not None and n < lo or hi is not None and n > hi:
         raise CellError(f"超出範圍 {lo}~{hi}：{n}")
     return n
+
+
+# 匯入範本的感測器下拉選單是「編號｜設備｜暱稱」，只取「｜」前面的編號
+SENSOR_REF_SEP = "｜"
+
+
+def p_sensor_ref(v, required=False):
+    s = p_str(v, required)
+    if s is None:
+        return None
+    code = s.split(SENSOR_REF_SEP, 1)[0].strip()
+    if not code and required:
+        raise CellError("必填")
+    return code or None
 
 
 def p_float(v, required=False):
@@ -141,6 +156,7 @@ class Change:
     row_no: int          # Excel 列號（標題列是第 1 列）
     diff: dict = field(default_factory=dict)   # update 時：{欄位: [舊, 新]}
     target_id: object = None                   # update 時的主鍵
+    auto_key: bool = False                     # insert 時 key 由系統自動編號（目前只有感測器）
 
 
 @dataclass
@@ -296,7 +312,11 @@ def plan_devices(df, ctx) -> Plan:
     return plan
 
 
+AUTO_SENSOR_CODE = "（自動編號）"
+
+
 def plan_sensors(df, ctx) -> Plan:
+    """sensor_code 空白 = 新增感測器並自動編號；有填 = 對應既有感測器更新（不存在就以該編號新增）。"""
     plan = Plan("sensors")
     if not _require_columns(df, ["sensor_code", "device_code", "sensor_type"], plan):
         return plan
@@ -305,7 +325,7 @@ def plan_sensors(df, ctx) -> Plan:
         if i in dup_rows:
             continue
         try:
-            code = p_str(r.get("sensor_code"), True, 50)
+            code = p_str(r.get("sensor_code"), False, 50)
             device_code = p_str(r.get("device_code"), True, 50)
             if device_code not in ctx["devices"]:
                 raise CellError(f"設備 {device_code} 不存在（請先匯入設備）")
@@ -333,8 +353,16 @@ def plan_sensors(df, ctx) -> Plan:
         except CellError as e:
             plan.errors.append((_row_no(i), str(e)))
             continue
+        if code is None:
+            plan.changes.append(Change("insert", AUTO_SENSOR_CODE, values, _row_no(i), auto_key=True))
+            continue
         existing = ctx["sensors"].get(code)
         _upsert(plan, existing, code, values, _row_no(i), existing and existing["sensor_id"])
+    auto = sum(c.auto_key for c in plan.changes)
+    if auto:
+        start = next_code(list(ctx["sensors"]) + [c.key for c in plan.changes if not c.auto_key])
+        plan.notes.append(f"{auto} 筆 sensor_code 空白，套用時自動編號（預計 {start}"
+                          + (f" ~ {start + auto - 1}" if auto > 1 else "") + "，依檔案順序）")
     return plan
 
 
@@ -395,7 +423,7 @@ def plan_modbus(df, ctx) -> Plan:
                 values["enabled"] = p_bool(r.get("enabled"), True)
             elif transport != "tcp":
                 raise CellError("尚未執行 sql/015，只支援 transport=tcp")
-            sensor_code = p_str(r.get("sensor_code"))
+            sensor_code = p_sensor_ref(r.get("sensor_code"))
             sensor_id = None
             if sensor_code:
                 sensor_id = ctx["sensor_ids"].get(sensor_code)
@@ -470,7 +498,7 @@ def plan_s7(df, ctx) -> Plan:
                               unit=p_str(r.get("unit")), enabled=p_bool(r.get("enabled"), True))
             elif area != "DB" or bit:
                 raise CellError("尚未執行 sql/019，只支援 DB 區域、bit 0")
-            sensor_code = p_str(r.get("sensor_code"))
+            sensor_code = p_sensor_ref(r.get("sensor_code"))
             sensor_id = None
             if sensor_code:
                 sensor_id = ctx["sensor_ids"].get(sensor_code)
@@ -505,7 +533,7 @@ def plan_opcua_bindings(df, ctx) -> Plan:
             if (server, node) in seen:
                 raise CellError("同一個點位在檔案中重複出現")
             seen.add((server, node))
-            sensor_code = p_str(r.get("sensor_code"))
+            sensor_code = p_sensor_ref(r.get("sensor_code"))
             sensor_id = None
             if sensor_code:
                 sensor_id = ctx["sensor_ids"].get(sensor_code)
@@ -531,7 +559,7 @@ def plan_alarm_rules(df, ctx) -> Plan:
             rule_id = p_int(r.get("rule_id"))
             if rule_id is not None and rule_id not in ctx["alarm_rules"]:
                 raise CellError(f"rule_id {rule_id} 不存在（新增規則請把 rule_id 留空）")
-            sensor_code = p_str(r.get("sensor_code"), True)
+            sensor_code = p_sensor_ref(r.get("sensor_code"), True)
             sensor_id = ctx["sensor_ids"].get(sensor_code)
             if sensor_id is None:
                 raise CellError(f"感測器 {sensor_code} 不存在")
@@ -732,7 +760,12 @@ def apply_plan(cur, plan: Plan) -> dict:
                 "upload_threshold", "opcua_sampling_interval_ms", "opcua_deadband_type",
                 "opcua_deadband_value", "state_dictionary"]
         device_lookup = "(SELECT device_id FROM devices WHERE device_code = %s)"
-        for c in plan.changes:
+        # 自動編號的放最後：先寫入檔案裡指定編號的，流水號才會接在它們後面，不會撞號
+        manual = [c for c in plan.changes if not c.auto_key]
+        auto = [c for c in plan.changes if c.auto_key]
+        for c in manual + auto:
+            if c.auto_key:
+                c.key = allocate_sensor_codes(cur)[0]
             params = tuple(c.values[k] for k in cols) + (c.values["device_code"],)
             if c.action == "insert":
                 cur.execute(f"INSERT INTO sensors ({', '.join(cols)}, device_id, sensor_code) "
@@ -764,4 +797,8 @@ def apply_plan(cur, plan: Plan) -> dict:
         # 那個旗標會觸發整台 Server 重新瀏覽（幾千個節點），只是改綁定不需要
         for c in plan.changes:
             cur.execute("UPDATE opcua_tags SET sensor_id=%s WHERE id=%s;", (c.values["sensor_id"], int(c.target_id)))
-    return {"inserted": len(plan.inserts), "updated": len(plan.updates)}
+    result = {"inserted": len(plan.inserts), "updated": len(plan.updates)}
+    generated = [c.key for c in plan.changes if c.auto_key]
+    if generated:
+        result["generated_codes"] = generated
+    return result

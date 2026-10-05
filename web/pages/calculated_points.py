@@ -17,6 +17,7 @@ from datetime import datetime
 
 from core.config import LOCAL_TZ, env_bool
 from data_layer.db_connector import DatabaseConnector
+from data_layer.sensor_codes import allocate_sensor_codes, next_code
 from services.alarm.rules import format_number
 from services.calc.expression import (
     CONSTANTS,
@@ -320,7 +321,7 @@ def _render_list(calcs: pd.DataFrame, catalog: pd.DataFrame, codes: set):
 def _render_add(calcs: pd.DataFrame, catalog: pd.DataFrame, codes: set):
     st.subheader("➕ 新增計算點")
     mode = st.segmented_control("結果存到", ["建立新感測器", "既有感測器"], default="建立新感測器", key="cp_mode")
-    target_code, new_sensor = None, None
+    target_code, new_sensor, auto = None, None, False
     if mode == "既有感測器":
         used = set(_load_sensor_binding_map())
         free = catalog[~catalog["sensor_id"].isin(used)]
@@ -335,7 +336,14 @@ def _render_add(calcs: pd.DataFrame, catalog: pd.DataFrame, codes: set):
         dev_labels = {int(r["device_id"]): f"{r['device_code']} {r['device_name'] or ''}" for _, r in devices.iterrows()}
         c1, c2, c3 = st.columns(3)
         device_id = c1.selectbox("所屬設備", list(dev_labels), format_func=dev_labels.get, key="cp_new_dev")
-        target_code = c2.text_input("感測器編號", key="cp_new_code", placeholder="例如 PLANT_TOTAL_KW").strip() or None
+        auto_code = str(next_code(codes))
+        target_code = c2.text_input(
+            "感測器編號（留空 = 自動編號）", key="cp_new_code", placeholder=f"自動編號：{auto_code}",
+            help="留空時依流水號自動產生；想在運算式裡用好記的名稱引用它（例如 PLANT_TOTAL_KW）才需要自己填。",
+        ).strip() or None
+        auto = target_code is None
+        if auto:
+            target_code = auto_code
         sensor_type = c3.text_input("感測器類型", "calculated", key="cp_new_type")
         c4, c5, c6 = st.columns(3)
         nickname = c4.text_input("暱稱", key="cp_new_nick", placeholder="全廠總功率")
@@ -345,7 +353,7 @@ def _render_add(calcs: pd.DataFrame, catalog: pd.DataFrame, codes: set):
         threshold = None
         if condition.startswith("threshold"):
             threshold = st.number_input("上傳門檻", value=1.0, key="cp_new_th")
-        if target_code and target_code in codes:
+        if not auto and target_code in codes:
             st.error(f"感測器編號 {target_code} 已存在，請改用「既有感測器」或換一個編號")
             target_code = None
         new_sensor = dict(device_id=device_id, sensor_type=sensor_type.strip() or "calculated",
@@ -378,6 +386,8 @@ def _render_add(calcs: pd.DataFrame, catalog: pd.DataFrame, codes: set):
             with DatabaseConnector.get_connection() as conn:
                 with conn.cursor() as cur:
                     if new_sensor:
+                        if auto:
+                            target_code = allocate_sensor_codes(cur)[0]
                         cur.execute("""INSERT INTO sensors (device_id, sensor_code, sensor_type, nickname, unit,
                                                             upload_condition, upload_threshold)
                                        VALUES (%(device_id)s, %(code)s, %(sensor_type)s, %(nickname)s, %(unit)s,

@@ -22,6 +22,7 @@
 | `019_s7_extensions.sql` | 🆕 v3.3：`tia_scada` 新增 `area`（DB/M/I/Q）、`bit_offset`、`rack`、`slot`、`enabled`、`unit` | v3.3 升級必跑（沒用 S7 也建議跑） |
 | `020_calc_state.sql` | 🆕 v3.3：`calculated_points.calc_state`（累計函式的狀態，重啟後接續） | v3.3 升級必跑 |
 | `021_calc_scripts.sql` | 🆕 v3.4：`calculated_points.kind`（expression / python）、`last_log`（Python 腳本計算點） | v3.4 升級必跑 |
+| `022_unique_sensor_binding.sql` | 🆕 `opcua_tags` / `modbus_scada` / `tia_scada` 的 `sensor_id` 加上 UNIQUE（延遲到交易結束才檢查），資料庫層保證一個感測器只綁一個點位 | 建議跑；已有重複綁定時會失敗，先解除重複再跑 |
 | `013_timeseries_policy.sql` | 🆕 **選用**：`sensor_readings` 啟用 TimescaleDB 壓縮（超過 30 天的 chunk 自動壓縮，不刪資料）。資料保留政策只寫在註解裡，需要時手動執行 | 確認後再跑，建議離峰時段 |
 
 ```bash
@@ -31,7 +32,8 @@ for f in 000_realtime_tables 001_sensor_hierarchy_and_mapping 006_opcua_upgrade 
          007_opcua_deadband 008_missing_app_columns 009_opcua_server_publish_interval \
          010_cumulative_counter_upload_condition 011_alarm_management 012_users_audit_status \
          014_reading_quality 015_modbus_transport 016_device_templates \
-         017_calculated_points 018_report_schedules 019_s7_extensions 020_calc_state 021_calc_scripts; do
+         017_calculated_points 018_report_schedules 019_s7_extensions 020_calc_state 021_calc_scripts \
+         022_unique_sensor_binding; do
   psql -h "$DB_HOST" -U <資料表擁有者> -d "$DB_NAME" -v ON_ERROR_STOP=1 \
        -v app_user="$DB_USER" -f "sql/$f.sql" || break
 done
@@ -44,7 +46,7 @@ done
 
 `002` ~ `005` **沒有對應的檔案**，不是遺失，是 v1 開發期間那幾版變更當時直接手動在資料庫上執行、沒有留下腳本。編號保留斷層是刻意的：`006` / `007` 這兩個號碼已經寫在程式碼的錯誤訊息（`data_layer/timeseries_writer.py`、`services/opcua_subscription_service.py`）與既有部署筆記裡，重新編號只會讓對照更亂。
 
-因此**全新部署依序跑 `000` → `001` → `006` → `007` → `008` → `009` → `010` → `011` → `012` → `014` → `015` → `016` → `017` → `018` → `019` → `020` → `021`**，中間跳號直接忽略（`013` 選用，可在任何時候執行，與 014 先後無關）。
+因此**全新部署依序跑 `000` → `001` → `006` → `007` → `008` → `009` → `010` → `011` → `012` → `014` → `015` → `016` → `017` → `018` → `019` → `020` → `021` → `022`**，中間跳號直接忽略（`013` 選用，可在任何時候執行，與 014 先後無關）。
 
 ## 📌 為什麼會有 008
 

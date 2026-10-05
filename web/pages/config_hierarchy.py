@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from data_layer.db_connector import DatabaseConnector
+from data_layer.sensor_codes import allocate_sensor_codes, peek_next_sensor_code
 from web.common import (
     _fetch_df,
     _normalize_state_dict,
@@ -25,9 +26,8 @@ def render():
     st.header("感測器階層管理")
     st.caption(
         "在這裡建立 廠區 → 產線 → 設備 → 感測器 的階層資料。"
-        "建立好 sensor 之後，回到「Modbus/TIA/OPC UA 點位設定」分頁，"
-        "把每個點位的 sensor_code 欄位選成對應的感測器，"
-        "採集程式就會自動把數值寫進 sensor_readings 時序表。"
+        "建立好 sensor 之後（sensor_code 會自動編號），回到「Modbus/TIA/OPC UA 點位設定」分頁"
+        "把點位綁定到對應的感測器，採集程式就會自動把數值寫進 sensor_readings 時序表。"
     )
 
     # ------------------------------------------------------------
@@ -406,6 +406,16 @@ def render():
         "其他（自訂）",
     ]
 
+    flash = st.session_state.pop("hier_sensor_flash", None)
+    if flash:
+        st.success(flash)
+    try:
+        with DatabaseConnector.get_connection() as conn:
+            with conn.cursor() as cur:
+                next_code = peek_next_sensor_code(cur)
+    except Exception:
+        next_code = "?"
+
     with st.form("add_sensor_form", clear_on_submit=True):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -414,7 +424,11 @@ def render():
             else:
                 new_sensor_device = None
                 st.warning("⚠️ 請先新增設備")
-            new_sensor_code = st.text_input("感測器編號 (sensor_code，唯一)", "")
+            st.text_input(
+                "感測器編號 (sensor_code)", value=f"自動編號（下一個是 {next_code}）", disabled=True,
+                help="sensor_code 由系統依流水號自動產生，不需要手動輸入。"
+                "要辨識用途請填下方的「暱稱」；需要指定編號的大量建立請用「批次匯入匯出」。",
+            )
             new_sensor_nickname = st.text_input(
                 "暱稱 (nickname，選填)", "", placeholder="例如：B03 蒸氣流量計"
             )
@@ -523,10 +537,11 @@ def render():
                 pass
             elif new_sensor_min is not None and new_sensor_max is not None and new_sensor_min > new_sensor_max:
                 st.error("❌ 警報下限大於警報上限")
-            elif new_sensor_code.strip() and new_sensor_device and final_sensor_type:
+            elif new_sensor_device and final_sensor_type:
                 try:
                     with DatabaseConnector.get_connection() as conn:
                         with conn.cursor() as cur:
+                            new_sensor_code = allocate_sensor_codes(cur)[0]
                             cur.execute(
                                 """
                                 INSERT INTO sensors
@@ -562,9 +577,12 @@ def render():
                             )
                             conn.commit()
                     audit_ui("sensor.create", f"sensor:{new_sensor_code}")
-                    st.success(f"🎉 成功新增感測器: {new_sensor_code}")
+                    nick = new_sensor_nickname.strip()
+                    st.session_state["hier_sensor_flash"] = (
+                        f"🎉 成功新增感測器：編號 {new_sensor_code}" + (f"（{nick}）" if nick else "")
+                    )
                     st.rerun()
                 except Exception as e:
-                    st.error(f"❌ 新增失敗（sensor_code 需為唯一值）: {e}")
+                    st.error(f"❌ 新增失敗: {e}")
             else:
-                st.warning("⚠️ 請輸入感測器編號並選擇所屬設備")
+                st.warning("⚠️ 請選擇所屬設備與感測器類型")

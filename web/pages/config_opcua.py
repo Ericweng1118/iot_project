@@ -11,13 +11,8 @@ import streamlit as st
 
 from data_layer.batch_updater import batch_update_opcua_tags
 from data_layer.db_connector import DatabaseConnector
+from web.binding_workbench import PointSpec, render_binding_workbench
 from web.common import (
-    UNBOUND_LABEL,
-    _binding_filter_caption,
-    _find_binding_conflict,
-    _load_sensor_binding_map,
-    _load_sensor_options,
-    _sensor_select_options,
     audit_ui,
     frame_changes,
     request_opcua_resubscribe,
@@ -31,6 +26,13 @@ try:
     OPCUA_AVAILABLE = True
 except ImportError:
     OPCUA_AVAILABLE = False
+
+
+def _fmt_current(v):
+    """current_data 是 {'val': ...} 的 JSON，表格只顯示數值本身。"""
+    if isinstance(v, dict) and "val" in v:
+        return str(v["val"])
+    return "" if v is None else str(v)
 
 
 def render():
@@ -403,6 +405,7 @@ def render():
         "或按上方「🚀 立即瀏覽並寫入資料庫」可以手動重新抓一次最新快照。"
     )
 
+    filter_label = "全部 Server"
     if not df_opcua_servers.empty:
         filter_options = ["全部 Server"] + [
             f"{row['server_name']} ({row['ip']}:{row['port']})"
@@ -419,84 +422,20 @@ def render():
         df_opcua_tags = load_opcua_tags()
 
     if not df_opcua_tags.empty:
-        opcua_label_to_id, opcua_id_to_label = _load_sensor_options()
-
-        df_opcua_tags["sensor_label"] = df_opcua_tags["sensor_id"].apply(
-            lambda sid: opcua_id_to_label.get(int(sid), UNBOUND_LABEL)
-            if pd.notnull(sid)
-            else UNBOUND_LABEL
+        df_opcua_tags["current_data"] = df_opcua_tags["current_data"].map(_fmt_current)
+        columns = ["id", "browse_name", "display_name", "data_type", "current_data", "quality", "last_update"]
+        if filter_label == "全部 Server":
+            columns.insert(1, "server_name")
+        render_binding_workbench(
+            PointSpec(
+                table="opcua_tags",
+                audit_action="opcua_tag.bind",
+                name_col="browse_name",
+                columns=columns,
+                search_cols=["server_name", "node_id", "browse_name", "display_name"],
+            ),
+            df_opcua_tags,
+            key="opcua_bind",
         )
-        df_opcua_tags_display = df_opcua_tags.drop(columns=["sensor_id"])
-
-        st.caption("💡 可直接在下方表格的「綁定感測器」欄位選擇對應感測器後按儲存。")
-
-        # 選單只列出「尚未被任何點位綁定」的感測器，避免上百個已綁定項目把選單塞爆。
-        # keep_ids 傳入本畫面各列自己目前的綁定，確保這些值仍留在 options 裡
-        # （SelectboxColumn 整欄共用一份選項，值不在選項內會被清空）。
-        opcua_binding_map = _load_sensor_binding_map()
-        opcua_options, opcua_hidden = _sensor_select_options(
-            opcua_label_to_id,
-            opcua_binding_map,
-            keep_ids=df_opcua_tags["sensor_id"].dropna().astype(int).tolist(),
-        )
-        _cap = _binding_filter_caption(opcua_hidden)
-        if _cap:
-            st.caption(_cap)
-
-        disabled_cols_opcua_tags = [
-            "id", "server_name", "node_id", "browse_name", "display_name",
-            "data_type", "current_data", "quality", "plc_state", "last_update",
-        ]
-
-        edited_opcua_tags_df = st.data_editor(
-            df_opcua_tags_display,
-            key="opcua_tags_editor",
-            disabled=disabled_cols_opcua_tags,
-            width="stretch",
-            column_config={
-                "sensor_label": st.column_config.SelectboxColumn(
-                    "綁定感測器 (sensor_code)",
-                    options=opcua_options,
-                    help="只列出尚未被其他點位綁定的感測器。"
-                    "選單內容請先在「感測器階層管理」分頁建立。",
-                )
-            },
-        )
-
-        if st.button("💾 儲存 OPC UA 點位綁定", type="primary"):
-            binding_map = _load_sensor_binding_map()
-            try:
-                with DatabaseConnector.get_connection() as conn:
-                    with conn.cursor() as cur:
-                        for index, row in edited_opcua_tags_df.iterrows():
-                            point_id = int(row["id"])
-
-                            sensor_label = row.get("sensor_label", UNBOUND_LABEL)
-                            sensor_id = (
-                                opcua_label_to_id.get(sensor_label)
-                                if sensor_label != UNBOUND_LABEL
-                                else None
-                            )
-                            conflict = _find_binding_conflict(
-                                binding_map, sensor_id, "opcua_tags", point_id
-                            )
-                            if conflict:
-                                st.error(
-                                    f"❌ id={point_id}（{row['node_id']}）想綁定的感測器"
-                                    f"已被其他點位使用：{conflict}，該筆未儲存。"
-                                    "同一個感測器不能同時綁定多個點位。"
-                                )
-                                continue
-
-                            cur.execute(
-                                "UPDATE opcua_tags SET sensor_id = %s WHERE id = %s;",
-                                (sensor_id, point_id),
-                            )
-                        conn.commit()
-                audit_ui("opcua_tag.bind", "opcua_tags", frame_changes(df_opcua_tags_display, edited_opcua_tags_df, "id"))
-                st.success("✅ OPC UA 點位綁定更新成功！")
-                st.rerun()
-            except Exception as e:
-                st.error(f"❌ 儲存失敗: {e}")
     else:
         st.info("目前尚無任何 OPC UA 點位資料，請先新增 Server 並執行瀏覽。")

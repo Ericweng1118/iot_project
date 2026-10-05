@@ -18,6 +18,7 @@ import pandas as pd
 import streamlit as st
 
 from data_layer import bulk_io
+from data_layer.import_templates import build_template
 from data_layer.db_connector import DatabaseConnector
 from web.common import OPCUA_ENABLED, audit_ui, now_local, require_role, table_exists, to_csv_bytes, to_excel_bytes
 
@@ -37,9 +38,10 @@ ENTITIES = {
     },
     "sensors": {
         "label": "🌡️ 感測器",
-        "help": "以 sensor_code 對應。device_code 必須已存在（設備請先在「設備」分頁匯入）。",
+        "help": "sensor_code 留空 = 新增感測器並自動編號；填既有編號 = 更新該感測器。"
+                "device_code 必須已存在（設備請先在「設備」分頁匯入）。",
         "columns": [
-            ("sensor_code", "✅", "感測器編號（唯一）"),
+            ("sensor_code", "✅（欄位）", "空白 = 新增並自動編號（建議）；填既有編號 = 更新"),
             ("device_code", "✅", "所屬設備"),
             ("sensor_type", "✅", "temperature / pressure / power / energy / flow …"),
             ("nickname", "", "暱稱"),
@@ -193,6 +195,18 @@ def _render_entity(entity):
             c3.download_button("⬇️ Excel", xlsx, file_name=f"{entity}_{stamp}.xlsx", key=f"ie_xlsx_{entity}",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+    t1, t2, _ = st.columns([1, 1, 2])
+    if t1.button("📄 準備匯入範本", key=f"ie_tpl_prep_{entity}",
+                 help="空白的 Excel 範本：必填欄位標色、標題有說明、選項欄位有下拉選單（依目前資料庫內容產生）。"
+                 + ("已預先列出所有未綁定的點位，只要填 sensor_code。" if entity == "opcua_bindings" else "")):
+        with DatabaseConnector.get_connection() as conn:
+            with conn.cursor() as cur:
+                st.session_state[f"ie_tpl_{entity}"] = build_template(cur, entity, spec["columns"])
+    template = st.session_state.get(f"ie_tpl_{entity}")
+    if template is not None:
+        t2.download_button("⬇️ 下載範本（Excel）", template, file_name=f"{entity}_範本.xlsx", key=f"ie_tpl_dl_{entity}",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
     nonce = st.session_state.get(f"ie_nonce_{entity}", 0)
     uploaded = st.file_uploader("上傳修改後的檔案（CSV 或 Excel）", type=["csv", "xlsx"],
                                 key=f"ie_upload_{entity}_{nonce}")
@@ -240,14 +254,19 @@ def _render_entity(entity):
         })
         st.session_state[f"ie_nonce_{entity}"] = nonce + 1     # 清掉上傳的檔案
         st.session_state.pop(f"ie_export_{entity}", None)
-        st.session_state["ie_done"] = f"✅ {spec['label']}：新增 {result['inserted']} 筆、更新 {result['updated']} 筆"
+        done = f"✅ {spec['label']}：新增 {result['inserted']} 筆、更新 {result['updated']} 筆"
+        codes = result.get("generated_codes")
+        if codes:
+            done += f"；自動編號 {codes[0]}" + (f" ~ {codes[-1]}" if len(codes) > 1 else "")
+        st.session_state["ie_done"] = done
         st.rerun()
 
 
 def render():
     require_role("engineer")
     st.title("📥 批次匯入匯出")
-    st.caption("匯出 → 用 Excel 批次修改 → 上傳預覽 → 確認套用。整批在同一個交易內完成，有任何錯誤都不會寫入。")
+    st.caption("修改既有資料：匯出 → 用 Excel 批次修改 → 上傳。從零建立：下載匯入範本 → 填寫 → 上傳。"
+               "上傳後會先預覽，確認才套用；整批在同一個交易內完成，有任何錯誤都不會寫入。")
     if st.session_state.get("ie_done"):
         st.success(st.session_state.pop("ie_done"))
 

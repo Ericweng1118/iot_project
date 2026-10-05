@@ -59,6 +59,19 @@ SELECT add_retention_policy('sensor_readings', INTERVAL '1 year');
 - `compress_segmentby = 'sensor_id'` 適合「依單一感測器查時間區間」的查詢樣式，
   若主要查詢是跨感測器聚合，segmentby 要重新選
 
+### 4. 綁定工作台套用到 Modbus / S7 頁面（2026-10-04 OPC UA 已改完並試用）
+
+OPC UA 點位頁已改用「綁定工作台」（`web/binding_workbench.py` + `data_layer/bindings.py`），
+Modbus 與 TIA (S7) 頁面還是舊的 `st.data_editor` + `SelectboxColumn` 逐列下拉，仍有舊問題：
+選單會列出畫面上其他列已綁定的感測器、同一次儲存裡兩列選同一個感測器時檢查不到、
+兩個點位互換感測器會被誤判成衝突、每次儲存都重寫所有列。
+
+- [ ] `config_modbus.py`：表格的 `sensor_label` 欄改唯讀，下方接 `render_binding_workbench(PointSpec(table="modbus_scada", …))`
+- [ ] `config_tia.py`：同上（`table="tia_scada"`）
+- [ ] 兩頁的「新增點位」表單與 `modbus_debug.py` / `s7_debug.py` 的「一鍵建立點位」改用 `bindings.bind()` 寫入綁定
+- [ ] 改完後 `web/common.py` 的 `_sensor_select_options` / `_binding_filter_caption` / `_find_binding_conflict` 若已無人使用就移除
+- [ ] 正式庫執行 `sql/022_unique_sensor_binding.sql`（2026-10-04 唯讀檢查過正式庫沒有重複綁定，可以直接跑）
+
 ---
 
 ## 🟡 觀察中
@@ -119,6 +132,16 @@ SELECT add_retention_policy('sensor_readings', INTERVAL '1 year');
 6. **opcua_tags 舊資料清理**：Server 端移除的點位目前只停止訂閱、資料列不會刪除（已知限制）
 
 ---
+
+## ✅ 已完成（2026-10-04）
+
+- OPC UA 點位頁改用「綁定工作台」：未綁定點位 × 未綁定感測器配對、已綁定可解除 / 改綁 / 互換，
+  每個動作一個交易（advisory lock + 樂觀鎖），不會再重複綁定（`web/binding_workbench.py`、`data_layer/bindings.py`）
+- `sql/022`：`opcua_tags` / `modbus_scada` / `tia_scada` 的 `sensor_id` 加 UNIQUE（DEFERRABLE），尚未在正式庫執行
+- 新增感測器的 `sensor_code` 改為自動流水號（`data_layer/sensor_codes.py`）：階層管理表單不再手動輸入、
+  計算點留空自動編號、批次匯入 `sensor_code` 留空 = 自動編號
+- 批次匯入匯出新增 Excel 匯入範本（`data_layer/import_templates.py`）：必填欄位標色、標題註解、
+  下拉選單（設備、感測器「編號｜設備｜暱稱」、各種選項）；OPC UA 綁定範本預先列出未綁定點位
 
 ## ✅ 已完成（2026-10-02，v3.4）
 

@@ -26,11 +26,12 @@ FROM python:3.12-slim AS runner
 
 WORKDIR /app
 
-# 設定 Python 效能與 Streamlit 容器設定
+# 設定 Python 效能與 Streamlit 容器設定；TZ 讓容器 log 顯示台灣時間（寫入 DB 的時間本來就帶時區，不受影響）
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
-    STREAMLIT_SERVER_HEADLESS=true
+    STREAMLIT_SERVER_HEADLESS=true \
+    TZ=Asia/Taipei
 
 # 安裝運行階段必要的動態庫
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -66,6 +67,11 @@ STOPSIGNAL SIGTERM
 
 CMD ["python", "run_all.py"]
 
-# sudo docker build -t unified_collector:20260911 .
-
-# sudo docker save unified_collector:20260911 | gzip > .docker_images/unified_collector_20260911.tar.gz
+# 建置與部署（v3.4）：
+#   sudo docker build -t unified_collector:20261002 .
+#   sudo docker run -d --name unified_collector --restart unless-stopped --env-file .env -p 1118:1118 \
+#        -v /opt/scada/data:/app/data --stop-timeout 30 unified_collector:20261002
+#   （RS-485 序列埠加 --device /dev/ttyUSB0；HTTPS 加 -v /opt/scada/certs:/app/certs:ro）
+#
+# 離線搬移：
+#   sudo docker save unified_collector:20261002 | gzip > .docker_images/unified_collector_20261002.tar.gz

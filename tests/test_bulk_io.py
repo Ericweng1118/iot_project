@@ -155,3 +155,33 @@ def test_s7_plan_address_and_validation():
     assert (run.values["area"], run.values["db_number"], run.values["offset"], run.values["bit_offset"]) == ("DB", 1, 10, 3)
     mw = next(c for c in plan.inserts if c.values["name"] == "MW")
     assert mw.values["area"] == "M" and mw.values["db_number"] == 0
+
+
+def test_sensors_blank_code_is_auto_numbered():
+    ctx = {"devices": {"B03": {}}, "sensors": {"181": {}, "182": {}, "B03_TEMP": {}}}
+    df = pd.DataFrame([
+        {"sensor_code": "", "device_code": "B03", "sensor_type": "power"},
+        {"sensor_code": None, "device_code": "B03", "sensor_type": "energy"},
+        {"sensor_code": "500", "device_code": "B03", "sensor_type": "flow"},   # 指定編號：流水號接在它後面
+    ])
+    plan = plan_sensors(df, ctx)
+    assert plan.ok
+    auto = [c for c in plan.inserts if c.auto_key]
+    assert len(auto) == 2 and [c.key for c in plan.inserts if not c.auto_key] == ["500"]
+    assert any("501 ~ 502" in n for n in plan.notes)
+
+
+def test_sensor_ref_accepts_template_dropdown_label():
+    from data_layer.bulk_io import p_sensor_ref
+    assert p_sensor_ref("45｜1-C10602-161｜洗滌塔即時功耗") == "45"
+    assert p_sensor_ref(45.0) == "45" and p_sensor_ref("") is None
+    ctx = {"sensor_ids": {"45": 1}, "opcua_tags": {("SIM", "n1"): {"id": 1, "sensor_id": None}}, "bindings": []}
+    plan = plan_opcua_bindings(pd.DataFrame([{"server_name": "SIM", "node_id": "n1",
+                                              "sensor_code": "45｜1-C10602-161｜洗滌塔"}]), ctx)
+    assert plan.ok and plan.changes[0].values["sensor_id"] == 1
+
+
+def test_next_sensor_code():
+    from data_layer.sensor_codes import next_code
+    assert next_code([]) == 1
+    assert next_code(["1", "182", "B03_TEMP", "²", "0099"]) == 183
