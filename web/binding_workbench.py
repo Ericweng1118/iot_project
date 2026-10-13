@@ -44,7 +44,7 @@ def _filter(df: pd.DataFrame, cols, text: str) -> pd.DataFrame:
     terms = [t for t in str(text or "").lower().split() if t]
     if not terms or df.empty:
         return df
-    hay = df[list(cols)].astype(str).agg(" ".join, axis=1).str.lower()
+    hay = df[list(cols)].astype(str).fillna("").agg(" ".join, axis=1).str.lower()
     mask = pd.Series(True, index=df.index)
     for t in terms:
         mask &= hay.str.contains(t, regex=False)
