@@ -112,5 +112,6 @@ PME 偵測到這筆事件，就對 `sensor_ids` 的 `from` ~ `to` 重算 `ems`�
 ## 6. 規劃中、會影響 PME 的事
 
 - `sensor_readings` 保留年限尚未決定；啟用前會先通知（刪除的資料無法復原）。
-- v3 尚未部署到正式容器；部署後寫入程式會換，`quality` 才會開始有值（v2 寫的都是 NULL）。
+- 正式環境的採集程式（`service_status.collector`）自 2026-10-05 起已是 v3.4，`quality` 有值；NULL 只出現在 v3.1 之前與 Influx 回補的資料。
+- `spool.drained` 事件（commit 105e7c4）要等採集程式容器重建後才會生效。
 - PME 專用 DB 帳號（`pme`）的權限調整：討論中，定案後補充於此。
