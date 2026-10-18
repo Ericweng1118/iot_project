@@ -223,3 +223,35 @@ def test_spool_survives_reopen_and_caps_size(tmp_path):
     assert rows[0][2] == at(2)                            # 時間含時區原樣還原
     sp2.delete_up_to(rows[1][0])
     assert sp2.count() == 1
+
+
+def test_drain_notifies_once_when_spool_empties(writer, monkeypatch):
+    """緩存分兩輪才補完：只在清空時寫一筆 spool.drained，範圍涵蓋兩輪。"""
+    from data_layer import timeseries_writer as tw
+
+    events = []
+    monkeypatch.setattr("core.audit.audit", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(tw, "SPOOL_DRAIN_BATCH", 2)
+    monkeypatch.setattr(tw, "SPOOL_DRAIN_MAX_BATCHES", 1)   # 每輪只補 2 筆
+    monkeypatch.setattr(writer, "_insert", lambda rows: None)
+
+    writer.spool.append([
+        (1, at(10), 1.0, Q.GOOD), (2, at(20), 2.0, Q.GOOD),
+        (1, at(30), 3.0, Q.GOOD), (3, at(40), 4.0, Q.COMM_LOST),
+        (2, at(5), 5.0, Q.GOOD),
+    ])
+
+    writer._drain_spool(at(100))
+    assert writer.spool.count() == 3 and events == []       # 還沒清空，不通知
+    writer._drain_spool(at(100))
+    assert writer.spool.count() == 1 and events == []
+    writer._drain_spool(at(100))
+    assert writer.spool.count() == 0 and len(events) == 1
+
+    (username, action, target, detail), _ = events[0]
+    assert (username, action, target) == ("system", "spool.drained", "sensor_readings")
+    assert detail["rows"] == 5 and detail["sensor_ids"] == [1, 2, 3]
+    assert detail["from"] == at(5).isoformat() and detail["to"] == at(40).isoformat()
+
+    writer._drain_spool(at(200))                              # 緩存已空，不重複通知
+    assert len(events) == 1
