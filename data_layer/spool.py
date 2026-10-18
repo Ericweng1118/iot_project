@@ -18,6 +18,7 @@ data_layer/spool.py
    否則「刪除重建容器」時緩存會跟著消失（單純 restart 不會）。
 """
 
+import json
 import logging
 import os
 import sqlite3
@@ -67,6 +68,8 @@ class ReadingSpool:
                 );
                 """
             )
+            # 補寫摘要與待回報的丟棄筆數；跟 readings 放同一個檔案，才能和刪除放在同一個交易
+            self._conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             self._conn.commit()
         return self._conn
 
@@ -88,6 +91,7 @@ class ReadingSpool:
                     (overflow,),
                 )
                 self.dropped_total += overflow
+                self._meta_add_int(db, "dropped_pending", overflow)
                 logger.error(
                     f"❌ 本機緩存已達上限 {self.max_rows:,} 筆，丟棄最舊的 {overflow:,} 筆"
                     "（資料庫已長時間無法寫入，請盡快處理）"
@@ -117,12 +121,48 @@ class ReadingSpool:
             ).fetchall()
         return [(i, s, datetime.fromisoformat(t), v, q) for i, s, t, v, q in rows]
 
-    def delete_up_to(self, last_id: int) -> None:
-        """補寫成功後刪除 id <= last_id 的資料（peek 是依 id 排序取出的）。"""
+    def delete_up_to(self, last_id: int, drain_summary: dict | None = None) -> None:
+        """
+        補寫成功後刪除 id <= last_id 的資料（peek 是依 id 排序取出的）。
+        drain_summary 有給就在同一個交易裡存起來：刪了資料卻沒記到範圍的情況不會發生，
+        程序中途重啟也能接著累積，緩存清空時的 spool.drained 範圍才完整。
+        """
         with self._lock:
             db = self._db()
             db.execute("DELETE FROM readings WHERE id <= ?;", (last_id,))
+            if drain_summary is not None:
+                db.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('drain_summary', ?);",
+                    (json.dumps(drain_summary),),
+                )
             db.commit()
+
+    def load_drain_summary(self) -> dict | None:
+        """尚未通知的補寫摘要：{rows, sensor_ids, from, to, dropped}，沒有則回傳 None。"""
+        if not self.path.exists() and self._conn is None:
+            return None
+        with self._lock:
+            db = self._db()
+            row = db.execute("SELECT value FROM meta WHERE key = 'drain_summary';").fetchone()
+            dropped = db.execute("SELECT value FROM meta WHERE key = 'dropped_pending';").fetchone()
+        if row is None and dropped is None:
+            return None
+        summary = json.loads(row[0]) if row else {"rows": 0, "sensor_ids": [], "from": None, "to": None}
+        summary["dropped"] = int(dropped[0]) if dropped else 0
+        return summary
+
+    def clear_drain_summary(self) -> None:
+        """spool.drained 通知成功寫入之後才呼叫。"""
+        with self._lock:
+            db = self._db()
+            db.execute("DELETE FROM meta WHERE key IN ('drain_summary', 'dropped_pending');")
+            db.commit()
+
+    @staticmethod
+    def _meta_add_int(db, key: str, n: int) -> None:
+        row = db.execute("SELECT value FROM meta WHERE key = ?;", (key,)).fetchone()
+        db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?);",
+                   (key, str((int(row[0]) if row else 0) + n)))
 
     def close(self):
         with self._lock:

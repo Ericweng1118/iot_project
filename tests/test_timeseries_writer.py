@@ -230,7 +230,7 @@ def test_drain_notifies_once_when_spool_empties(writer, monkeypatch):
     from data_layer import timeseries_writer as tw
 
     events = []
-    monkeypatch.setattr("core.audit.audit", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr("core.audit.audit", lambda *a, **k: events.append((a, k)) or True)
     monkeypatch.setattr(tw, "SPOOL_DRAIN_BATCH", 2)
     monkeypatch.setattr(tw, "SPOOL_DRAIN_MAX_BATCHES", 1)   # 每輪只補 2 筆
     monkeypatch.setattr(writer, "_insert", lambda rows: None)
@@ -255,3 +255,62 @@ def test_drain_notifies_once_when_spool_empties(writer, monkeypatch):
 
     writer._drain_spool(at(200))                              # 緩存已空，不重複通知
     assert len(events) == 1
+
+
+def _small_batches(monkeypatch, writer):
+    from data_layer import timeseries_writer as tw
+
+    monkeypatch.setattr(tw, "SPOOL_DRAIN_BATCH", 2)
+    monkeypatch.setattr(tw, "SPOOL_DRAIN_MAX_BATCHES", 1)   # 每輪只補 2 筆
+    monkeypatch.setattr(writer, "_insert", lambda rows: None)
+
+
+def test_drain_summary_survives_restart(tmp_path, monkeypatch):
+    """補寫到一半程序重啟：新的 writer 接著累積，通知範圍涵蓋重啟前後。"""
+    events = []
+    monkeypatch.setattr("core.audit.audit", lambda *a, **k: events.append(a[3]) or True)
+    path = tmp_path / "spool.sqlite3"
+    w1 = SensorReadingWriter(flush_interval_seconds=60, spool=ReadingSpool(path))
+    _small_batches(monkeypatch, w1)
+    w1.spool.append([(1, at(10), 1.0, Q.GOOD), (2, at(20), 2.0, Q.GOOD), (3, at(30), 3.0, Q.GOOD)])
+    w1._drain_spool(at(100))
+    assert w1.spool.count() == 1 and events == []
+    w1.spool.close()
+
+    w2 = SensorReadingWriter(flush_interval_seconds=60, spool=ReadingSpool(path))   # 模擬重啟
+    _small_batches(monkeypatch, w2)
+    w2._drain_spool(at(100))
+    assert w2.spool.count() == 0 and len(events) == 1
+    assert events[0]["rows"] == 3 and events[0]["sensor_ids"] == [1, 2, 3]
+    assert events[0]["from"] == at(10).isoformat() and events[0]["to"] == at(30).isoformat()
+    assert w2.spool.load_drain_summary() is None
+
+
+def test_drain_notify_retried_when_audit_fails(writer, monkeypatch):
+    """audit_log 寫入失敗時摘要留著，下一輪（緩存已空）重送。"""
+    results = iter([False, True])
+    events = []
+    monkeypatch.setattr("core.audit.audit", lambda *a, **k: events.append(a[3]) or next(results))
+    _small_batches(monkeypatch, writer)
+    writer.spool.append([(1, at(10), 1.0, Q.GOOD)])
+    writer._drain_spool(at(100))
+    assert len(events) == 1 and writer.spool.load_drain_summary() is not None
+    writer._drain_spool(at(160))
+    assert len(events) == 2 and events[1]["rows"] == 1
+    assert writer.spool.load_drain_summary() is None
+    writer._drain_spool(at(220))
+    assert len(events) == 2
+
+
+def test_dropped_rows_reported_in_drain_event(tmp_path, monkeypatch):
+    """緩存超過上限丟棄的筆數存在緩存檔裡，隨 spool.drained 回報一次後歸零。"""
+    events = []
+    monkeypatch.setattr("core.audit.audit", lambda *a, **k: events.append(a[3]) or True)
+    w = SensorReadingWriter(flush_interval_seconds=60, spool=ReadingSpool(tmp_path / "s.sqlite3", max_rows=2))
+    monkeypatch.setattr(w, "_insert", lambda rows: None)
+    w.spool.append([(1, at(i), float(i), Q.GOOD) for i in range(5)])     # 丟掉最舊 3 筆
+    w._drain_spool(at(100))
+    assert events[0]["dropped"] == 3 and events[0]["rows"] == 2
+    w.spool.append([(1, at(200), 1.0, Q.GOOD)])
+    w._drain_spool(at(300))
+    assert events[1]["dropped"] == 0

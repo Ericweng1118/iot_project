@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 _warned = False
 
 
-def audit(username: str, action: str, target: str | None = None, detail=None) -> None:
+def audit(username: str, action: str, target: str | None = None, detail=None) -> bool:
+    """回傳是否寫入成功；一般操作不用理會，需要確認送達的呼叫端（例如 spool.drained）才看。"""
     global _warned
     from data_layer.db_connector import DatabaseConnector
 
@@ -37,7 +38,9 @@ def audit(username: str, action: str, target: str | None = None, detail=None) ->
                         if detail is not None else None,
                     ),
                 )
+        return True
     except Exception as e:
         if not _warned:
             logger.warning(f"⚠️ 寫入 audit_log 失敗（尚未執行 sql/012？），之後的失敗不再重複提示: {e}")
             _warned = True
+        return False

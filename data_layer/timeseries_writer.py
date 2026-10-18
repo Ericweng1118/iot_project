@@ -132,9 +132,6 @@ class SensorReadingWriter:
         self.spool = spool if spool is not None else ReadingSpool()
         self._has_quality_column = None
         self._quality_checked_at = 0.0
-        # 本機緩存補寫摘要：一次斷線可能要跨好幾個寫入週期才補完，緩存清空時才通知一次
-        # （只存在記憶體；補寫途中程序重啟，通知的範圍只會涵蓋重啟後補寫的部分）
-        self._drain_summary = None
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -436,7 +433,11 @@ class SensorReadingWriter:
         """資料庫正常時，把本機緩存的資料依寫入順序補寫回去。"""
         try:
             if not self.spool.count():
+                # 緩存已空但還有沒送出的通知（上次寫 audit_log 失敗）→ 重送
+                self._notify_drain_complete()
                 return
+            # 一次斷線可能要跨好幾個寫入週期、甚至跨程序重啟才補完；摘要存在緩存檔裡接著累積
+            summary = self.spool.load_drain_summary()
         except Exception as e:
             logger.error(f"讀取本機緩存失敗: {e}")
             return
@@ -450,9 +451,9 @@ class SensorReadingWriter:
             except Exception as e:
                 self._record_error(f"補寫本機緩存失敗，下一輪再試: {e}", wall_now)
                 break
-            self.spool.delete_up_to(batch[-1][0])
+            summary = self._merge_drain_summary(summary, batch)
+            self.spool.delete_up_to(batch[-1][0], drain_summary=summary)
             drained += len(batch)
-            self._accumulate_drain(batch)
         if drained:
             remaining = self.spool.count()
             with self._lock:
@@ -464,37 +465,34 @@ class SensorReadingWriter:
             if not remaining:
                 self._notify_drain_complete()
 
-    def _accumulate_drain(self, batch):
-        """記下這批補寫涉及的 sensor_id、時間範圍與筆數，供緩存清空時通知 PME。"""
+    @staticmethod
+    def _merge_drain_summary(summary, batch):
+        """把這批補寫的 sensor_id、時間範圍與筆數併進摘要（摘要以 JSON 存在緩存檔，時間用 ISO 字串）。"""
         times = [t for _id, _s, t, _v, _q in batch]
-        summary = self._drain_summary
-        if summary is None:
-            summary = self._drain_summary = {
-                "rows": 0, "sensor_ids": set(), "from": min(times), "to": max(times),
-            }
+        summary = dict(summary or {"rows": 0, "sensor_ids": [], "from": None, "to": None})
+        summary.pop("dropped", None)          # 丟棄筆數由緩存檔另外累計，不放在摘要裡
+        lo, hi = min(times), max(times)
+        if summary["from"]:
+            lo = min(lo, datetime.fromisoformat(summary["from"]))
+            hi = max(hi, datetime.fromisoformat(summary["to"]))
         summary["rows"] += len(batch)
-        summary["sensor_ids"].update(s for _id, s, _t, _v, _q in batch)
-        summary["from"] = min(summary["from"], min(times))
-        summary["to"] = max(summary["to"], max(times))
+        summary["sensor_ids"] = sorted(set(summary["sensor_ids"]) | {s for _id, s, _t, _v, _q in batch})
+        summary["from"], summary["to"] = lo.isoformat(), hi.isoformat()
+        return summary
 
     def _notify_drain_complete(self):
         """
         緩存清空後寫一筆 audit_log（action='spool.drained'）。補寫進來的資料 reading_time
         比 PME 的讀取游標更早，PME 讀不到，靠這筆事件得知要重算哪些 sensor、哪段時間。
-        格式約定見 docs/PME_INTERFACE.md。audit() 內部吞掉例外，不會影響補寫本身。
+        格式約定見 docs/PME_INTERFACE.md。寫入成功才清掉摘要；失敗就留著，下一輪重送。
         """
-        summary, self._drain_summary = self._drain_summary, None
+        summary = self.spool.load_drain_summary()
         if not summary:
             return
         from core.audit import audit  # 延遲 import，避免 data_layer 與 core 互相依賴
 
-        audit("system", "spool.drained", "sensor_readings", {
-            "rows": summary["rows"],
-            "sensor_ids": sorted(summary["sensor_ids"]),
-            "from": summary["from"].isoformat(),
-            "to": summary["to"].isoformat(),
-            "dropped": self.spool.dropped_total,   # 緩存超過上限而丟棄的筆數（程序啟動後累計）
-        })
+        if audit("system", "spool.drained", "sensor_readings", summary):
+            self.spool.clear_drain_summary()
 
     @classmethod
     def _plan_write(
