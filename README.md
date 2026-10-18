@@ -47,6 +47,19 @@ pip install -r requirements-dev.txt
 python -m pytest tests
 ```
 
+需要資料庫的整合測試（`tests/test_bindings.py` 等）、migration、權限腳本，一律先在**隔離測試庫**跑，
+不要用 `.env`（它指向正式庫）。[`scripts/test_db.sh`](scripts/test_db.sh) 會用正式庫同一個 image
+起一個容器（127.0.0.1:55432、記憶體上限 512 MB），複製角色、結構、Energy 庫與最近 7 天的時序資料，用完即刪：
+
+```bash
+scripts/test_db.sh up && scripts/test_db.sh load   # 約 1 分鐘
+eval "$(scripts/test_db.sh env)"                    # 這個 shell 之後連的都是測試庫
+python -m pytest tests                              # 整合測試不再被跳過
+scripts/test_db.sh down                             # 刪除容器與全部資料
+```
+
+參數（port、天數、記憶體、密碼）見腳本開頭說明。PME 也共用這個測試庫。
+
 ## 常用設定（完整清單見 `env.example`）
 
 | 變數 | 預設 | 說明 |
