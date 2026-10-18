@@ -474,3 +474,19 @@ def frame_changes(before: pd.DataFrame, after: pd.DataFrame, id_col: str, limit:
                 changes["_truncated"] = True
                 break
     return changes
+
+
+def attach_sensor_ids(changes: dict, df: pd.DataFrame, id_col: str = "id") -> dict:
+    """
+    在 frame_changes() 每一列的結果補上該點位（變更前）綁定的 sensor_id。
+    modbus_scada / tia_scada 的列 id 是點位 id，PME 讀 audit_log 偵測倍率、data_type 變更時
+    要知道影響哪個計量點，又不該為此開放讀這兩張表（約定見 docs/PME_INTERFACE.md）。
+    """
+    if not isinstance(changes, dict) or "sensor_id" not in df.columns or id_col not in df.columns:
+        return changes
+    lookup = {str(k): v for k, v in zip(df[id_col], df["sensor_id"])}
+    for rid, diffs in changes.items():
+        if isinstance(diffs, dict):   # 跳過 _truncated / note 這類非列資料
+            sid = lookup.get(rid)
+            diffs["sensor_id"] = None if _is_null(sid) else int(sid)
+    return changes

@@ -19,6 +19,7 @@ from web.common import (
     _load_sensor_options,
     _normalize_state_dict,
     _sensor_select_options,
+    attach_sensor_ids,
     audit_ui,
     frame_changes,
     require_role,
@@ -262,7 +263,8 @@ def render():
                                     ),
                                 )
                         conn.commit()
-                audit_ui("modbus.update", "modbus_scada", frame_changes(df_modbus_display, edited_modbus_df, "id"))
+                audit_ui("modbus.update", "modbus_scada",
+                         attach_sensor_ids(frame_changes(df_modbus_display, edited_modbus_df, "id"), df_modbus))
                 st.success("✅ Modbus 點位參數更新成功！")
                 st.rerun()
             except Exception as e:

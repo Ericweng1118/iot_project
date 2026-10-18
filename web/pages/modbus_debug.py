@@ -470,7 +470,11 @@ def _tab_verify():
             bo, wo = ORDER_PRESETS[order]
             old = next(r["目前順序"] for r in rows if r["id"] == tag_id)
             execute("UPDATE modbus_scada SET byte_order=%s, word_order=%s WHERE id=%s;", (bo, wo, int(tag_id)))
-            audit_ui("modbus.update", f"modbus:{tag_id}", {"byte/word order": [old, order], "source": "線上調適"})
+            # 補上綁定的 sensor_id：PME 依此判斷哪個計量點的數值從這一刻起換了解讀方式
+            bound = fetch_df("SELECT sensor_id FROM modbus_scada WHERE id = %s;", (int(tag_id),), show_error=False)
+            sensor_id = None if bound.empty or pd.isnull(bound.iloc[0]["sensor_id"]) else int(bound.iloc[0]["sensor_id"])
+            audit_ui("modbus.update", f"modbus:{tag_id}",
+                     {"byte/word order": [old, order], "source": "線上調適", "sensor_id": sensor_id})
             st.success(f"✅ 已將點位 #{tag_id} 改為 {order}（{bo}/{wo}），下一輪採集生效。")
             st.session_state.pop("mbv_result", None)
 
