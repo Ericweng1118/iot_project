@@ -79,6 +79,7 @@ main.py        採集主程式    admin_app.py  網頁入口    run_all.py  同�
 | 文件 | 內容 |
 | --- | --- |
 | [docs/MANUAL.md](docs/MANUAL.md) | 詳細手冊：各功能說明、執行架構、網頁操作、常見問題排查 |
+| [docs/PME_INTERFACE.md](docs/PME_INTERFACE.md) | 與 PME（能源管理系統）共用資料庫的介面約定：依賴的表欄位、quality 語意、`spool.drained` 事件、通知規則 |
 | [README_DB.md](README_DB.md) | 資料庫 schema 參考 |
 | [sql/README.md](sql/README.md) | migration 執行順序與各檔用途 |
 | [UPGRADE_NOTES_v2.md](UPGRADE_NOTES_v2.md) / [UPGRADE_NOTES_v3.md](UPGRADE_NOTES_v3.md) | 各版本升級步驟、行為變化 |
