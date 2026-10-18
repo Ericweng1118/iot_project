@@ -93,6 +93,22 @@ PME 偵測到這筆事件，就對 `sensor_ids` 的 `from` ~ `to` 重算 `ems`�
 
 補寫摘要與丟棄筆數存在本機緩存檔裡（和刪除已補寫資料在同一個交易），補寫途中採集程式重啟也會接著累積，事件範圍涵蓋整次斷線。寫入 `audit_log` 失敗時摘要會保留，下一個寫入週期重送；極少數情況（寫入成功但清除摘要前當機）可能收到同一範圍兩次，PME 重算是冪等的，不影響結果。
 
+### 設定變更的稽核事件（PME 只標示、不自動重算）
+
+SCADA 網頁修改設定時都會寫 `audit_log`，`audit_log.ts` 就是生效時間（採集程式下次重新載入設定才套用，會晚幾秒到一兩分鐘；rebase 取 `ts` 之後第一個 15 分鐘格）。
+`sensor_readings` 存的是**工程值**（Modbus：解碼 → 線性換算 → 四捨五入到 4 位），所以倍率變更只影響之後的讀值，舊資料不會跟著變。
+
+| `action` | `detail` 格式 | 影響 |
+| --- | --- | --- |
+| `sensor.update` | `{sensor_id: {欄位: [舊, 新]}}` | `unit`、`device_id`、`upload_condition` 等 |
+| `modbus.update` | `{點位 id: {欄位: [舊, 新], "sensor_id": 綁定的 sensor_id}}` | 倍率（`raw_min/max`、`eng_min/max`）、`data_type`、byte/word order |
+| `modbus.update`（線上調適） | `{"byte/word order": [舊, 新], "source": "線上調適", "sensor_id": …}` | 數值解讀方式 |
+| `tia.update` | 同 `modbus.update` | S7 位址、`data_type` |
+| `import.<entity>` | `{"keys": […], "diffs": {…}, "sensor_ids": [受影響的既有 sensor_id]}` | 批次匯入（`sensors` / `modbus` / `s7` / `opcua_bindings` 才有 `sensor_ids`） |
+
+`sensor_id` 是**變更前**綁定的感測器；綁定本身有改時，新的綁定會出現在該列的 diff 裡（`sensor_label` 或 `sensor_id` 欄）。
+直接用 pgAdmin / 腳本改資料庫不會留稽核紀錄，這類變更仍依第 5 節規則人工通知。
+
 ## 4. 增量讀取建議
 
 - 累計型點位用 `reading_time > cursor` 增量讀即可，晚到的資料只會讓用量分攤到不同時段，不會少算。
