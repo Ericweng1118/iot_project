@@ -3,6 +3,7 @@
 import pandas as pd
 
 from data_layer.bulk_io import (
+    affected_sensor_ids,
     plan_alarm_rules,
     plan_devices,
     plan_modbus,
@@ -185,3 +186,21 @@ def test_next_sensor_code():
     from data_layer.sensor_codes import next_code
     assert next_code([]) == 1
     assert next_code(["1", "182", "B03_TEMP", "²", "0099"]) == 183
+
+
+def test_affected_sensor_ids_for_audit():
+    """匯入的 audit detail 帶 sensor_ids：點位取新舊綁定，感測器只取更新的既有感測器。"""
+    base = {"plc_ip": "10.0.0.1", "slave_id": 1, "function_code": 3, "data_type": "float"}
+    df = pd.DataFrame([
+        {**base, "id": 10, "name": "A", "start_address": 0, "byte_order": "big", "word_order": "LITTLE",
+         "unit": "V", "sensor_code": None},                                     # 解除 S1 綁定 → 1
+        {**base, "name": "B", "start_address": 2, "sensor_code": "S1"},         # S1 綁到新點位 → 1
+    ])
+    plan = plan_modbus(df, _modbus_ctx())
+    assert plan.ok and affected_sensor_ids(plan) == [1]
+
+    from data_layer.bulk_io import Change, Plan
+    sensors = Plan("sensors", changes=[Change("update", "T1", {}, 2, {"unit": ["kg", "t"]}, 5),
+                                       Change("insert", "(自動)", {}, 3, auto_key=True)])
+    assert affected_sensor_ids(sensors) == [5]
+    assert affected_sensor_ids(Plan("alarm_rules", changes=[Change("insert", "x", {"sensor_id": 9}, 2)])) == []

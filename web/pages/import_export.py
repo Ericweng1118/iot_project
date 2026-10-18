@@ -250,6 +250,7 @@ def _render_entity(entity):
         audit_ui(f"import.{entity}", entity, {
             "file": uploaded.name, **result,
             "keys": [c.key for c in applied.changes][:200],
+            "sensor_ids": bulk_io.affected_sensor_ids(applied),
             "diffs": {c.key: c.diff for c in applied.updates[:200]},
         })
         st.session_state[f"ie_nonce_{entity}"] = nonce + 1     # 清掉上傳的檔案

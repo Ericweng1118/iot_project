@@ -181,6 +181,31 @@ class Plan:
         return not self.errors
 
 
+# 這些匯入會改到「既有感測器的資料怎麼來」：感測器本身的設定，或點位的換算 / 綁定
+_SENSOR_AFFECTING = {"sensors", "modbus", "s7", "opcua_bindings"}
+
+
+def affected_sensor_ids(plan: Plan) -> list:
+    """
+    這次匯入影響到的既有 sensor_id，寫進 audit_log（import.<entity>）給 PME 判斷要提示哪些計量點。
+    detail 裡原本的 keys 是代碼 / 點位 id，PME 不該為了對照而去讀 modbus_scada 等表
+    （約定見 docs/PME_INTERFACE.md）。新增的感測器沒有歷史資料，不列入。
+    """
+    if plan.entity not in _SENSOR_AFFECTING:
+        return []
+    ids = set()
+    for c in plan.changes:
+        if plan.entity == "sensors":
+            if c.action == "update" and c.target_id is not None:
+                ids.add(int(c.target_id))
+            continue
+        # 點位：新綁定的感測器，以及改綁 / 解除綁定前的感測器都算
+        new = c.values.get("sensor_id")
+        old = c.diff.get("sensor_id", [None, None])[0]
+        ids.update(int(x) for x in (new, old) if x is not None)
+    return sorted(ids)
+
+
 def _row_no(i: int) -> int:
     return i + 2
 
