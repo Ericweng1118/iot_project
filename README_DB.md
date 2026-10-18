@@ -109,6 +109,8 @@ opcua_tags      ─┘                          └── devices（設備）
 | `sensors` | `sensor_id`, `device_id`, `sensor_code`(唯一), `sensor_type`, `unit`, `min_threshold`, `max_threshold`, `nickname`, `state_dictionary` **＋ v2 新增欄位（見下表）** | 感測器，屬於某台設備；閾值欄位供「異常監控」分頁比對用，資料庫本身不會自動觸發告警 |
 | `sensor_readings` | `reading_id`, `sensor_id`, `reading_time`, `value` | 時序數據，**TimescaleDB hypertable**，主鍵為 `(sensor_id, reading_time)` |
 
+> **歷史回補**：2026-10-16 從舊系統（研華 RTM 的 InfluxDB）回補了 254 個 sensor 在「各自 PG 第一筆」之前的資料（最早 2025-12-05，約 7,436 萬筆，`quality` 為 NULL，數值精度到小數第 2 位），之後再刪除其中 1,061,557 筆錯誤讀值（VCB 12 月字組錯誤、累計表讀成 0、通訊錯誤值、B05 整段）。原始備份、對照表、截止時間與還原 SQL 在 `/home/eric/桌面/influx_backup/`（`import/cutoffs.csv`、`import/rollback.sql`、`cleanup/delete_rows.csv`）。
+
 ---
 
 #### `sensors` 的 v2 新增欄位
