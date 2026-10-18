@@ -33,3 +33,13 @@ def test_password_policy():
     assert validate_new_password("12345678") is not None
     assert validate_new_password("abcdefgh") is not None
     assert validate_new_password("abcd1234") is None
+
+
+def test_shared_login_vector_with_pme():
+    """
+    PME 共用 app_users 登入，自己實作同格式的 PBKDF2 驗證（PME 的 core/security.py）。
+    兩邊放同一組測試向量：SCADA 換雜湊格式或演算法時，兩邊的這個測試會一起失敗，不會悄悄讓 PME 無法登入。
+    """
+    vector = "pbkdf2_sha256$260000$Ll/ReHS3Bie0gZmOacMGaw==$di5At4qKMcS43IiZaNZijGqfjQEu8c4VDVbmrlZH6PM="
+    assert verify_password("pme-contract-test", vector)
+    assert not verify_password("pme-contract-tesT", vector)
