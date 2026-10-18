@@ -121,7 +121,7 @@ SCADA 網頁修改設定時都會寫 `audit_log`，`audit_log.ts` 就是生效�
 2. 累計型點位維持 `on_change` 上傳。
 3. **需要 PME 重算 `ems` 時**，SCADA 提供 sensor_id 清單與時間範圍，情況包括：回補 `sensor_readings`、刪除 `sensor_readings` 的資料、spool 補寫（用第 3 節的事件）、更改 sensor 的 `unit` 或倍率。
 4. SCADA 不動 `ems`；PME 不動 `public`（上述兩個例外除外）與 iot_project 的檔案。重建 timescaledb 容器前先通知。
-5. 各自照自己 repo 的分支慣例 commit（PME：`main`；iot_project：`v2-dev`），push 一律由 Eric 做。
+5. 各自照自己 repo 的分支慣例 commit（PME 與 iot_project 都用 `main`），push 一律由 Eric 做。
 6. 訊息格式：目的 / 影響的 sensor_id 或表 / 時間範圍 / 需要對方做什麼 / 完成條件。
 7. 啟用 retention、部署 v3、重建容器之前，提前通知並附預計停機時間。
 
