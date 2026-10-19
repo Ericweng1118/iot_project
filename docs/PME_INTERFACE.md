@@ -9,6 +9,7 @@
 - **PME 只寫 `ems` schema**（啟動時自動 migration）；`public` 只讀，唯一例外：
   - `audit_log`：PME 寫入，`action` 一律以 `ems.` 為前綴（含前綴不超過 50 字元）。
   - `app_users.last_login`：登入時更新。
+  - `app_users` 的帳號管理（PME 使用者管理頁，admin 專用）：欄位層級 `INSERT (username, password_hash, display_name, role, enabled)` 與 `UPDATE (password_hash, display_name, role, enabled)`，由 `sql/023_pme_app_users_grant.sql` 授權（前提是 PME 的 005 已建立 `pme` 角色）。**不授權 DELETE**（停用用 `enabled = false`）、不可改 `username`。對應稽核 action：`ems.user.create` / `ems.user.update` / `ems.user.reset_password`。
 - SCADA 不動 `ems`、`energy_ext`、`erp_ext`。
 
 ## 2. PME 依賴的 public 表
@@ -69,8 +70,11 @@
 
 ### `app_users`
 `username`（PK）、`display_name`、`password_hash`、`role`（`viewer` / `operator` / `engineer` / `admin`）、`enabled`、`created_at`、`last_login`。
-- `password_hash` 格式 `pbkdf2_sha256$<iterations>$<salt_b64>$<hash_b64>`（260,000 次，見 `core/auth.py`）。
-- `.env` 的 `ADMIN_USER` 救援帳號**不在這張表裡**。
+- 型別：`username VARCHAR(50)` PK、`display_name VARCHAR(100)` 可 NULL、`password_hash VARCHAR(255)` NOT NULL、`role VARCHAR(20)` NOT NULL 預設 `viewer`（CHECK `chk_app_users_role`，不是 enum）、`enabled BOOLEAN` NOT NULL 預設 TRUE、`created_at TIMESTAMPTZ` NOT NULL 預設 `now()`、`last_login TIMESTAMPTZ`。沒有 id / sequence、沒有 trigger。
+- `username` 區分大小寫（無 `lower()` / citext）。SCADA 規則：strip 後只允許英數與 `_ . -`、不得等於 `.env` 的 `ADMIN_USER`；PME 沿用同一規則並多擋「與既有帳號只差大小寫」。
+- `password_hash` 格式 `pbkdf2_sha256$<iterations>$<salt_b64>$<hash_b64>`（PBKDF2-HMAC-SHA256、260,000 次、salt 16 bytes、標準 base64 含 padding，見 `core/auth.py`；對齊用測試向量在 `tests/test_auth.py`）。
+- 密碼政策（`validate_new_password`）：至少 8 字元；不得全為數字或全為字母（Python `str.isdigit()` / `isalpha()`）；無上限、無強制改密碼。
+- `.env` 的 `ADMIN_USER` 救援帳號**不在這張表裡**。登入時 SCADA 先查本表，**有同名列就以該列為準、不會退回救援帳號**，所以任何一方都不得建立與 `ADMIN_USER` 同名的列（PME 把該名稱列為保留帳號，文件中不寫出其值）。
 
 ### `audit_log`
 `id`、`ts`、`username`（NOT NULL）、`action`（VARCHAR(50)）、`target`（VARCHAR(200)）、`detail`（JSONB）。
@@ -124,10 +128,11 @@ SCADA 網頁修改設定時都會寫 `audit_log`，`audit_log.ts` 就是生效�
 5. 各自照自己 repo 的分支慣例 commit（PME 與 iot_project 都用 `main`），push 一律由 Eric 做。
 6. 訊息格式：目的 / 影響的 sensor_id 或表 / 時間範圍 / 需要對方做什麼 / 完成條件。
 7. 啟用 retention、部署 v3、重建容器之前，提前通知並附預計停機時間。
+8. **`app_users` 雙方都能寫**：SCADA 管理頁（`web/pages/users.py`）與 PME 管理頁同時改同一筆時，後寫者贏（無樂觀鎖、無 `updated_at`）。SCADA 儲存時會對有變動的列一次寫 `display_name` / `role` / `enabled`；PME 請只 `UPDATE` 有變動的欄位並用 `WHERE username = …`。SCADA 的 Streamlit session 在登入當下取一次角色與 `enabled`，PME 停用或降級帳號**不會讓對方已登入的 SCADA session 立即失效**，要等重新登入或閒置逾時。pme 帳號因此等同擁有 SCADA admin 權限，PME 端需限制 admin 才能操作、禁止停用 / 降級自己與最後一位啟用中的 admin。
 
 ## 6. 規劃中、會影響 PME 的事
 
 - `sensor_readings` 保留年限尚未決定；啟用前會先通知（刪除的資料無法復原）。
 - 正式環境的採集程式（`service_status.collector`）自 2026-10-05 起已是 v3.4，`quality` 有值；NULL 只出現在 v3.1 之前與 Influx 回補的資料。
 - `spool.drained` 事件（commit 105e7c4）要等採集程式容器重建後才會生效。
-- PME 專用 DB 帳號（`pme`）的權限調整：討論中，定案後補充於此。
+- PME 專用 DB 帳號（`pme`）的權限：`app_users` 欄位層級寫入已定案，由 `sql/023_pme_app_users_grant.sql` 授權（回滾 `sql/023_rollback.sql`）；由 Eric 以資料表擁有者身分在 PME 的 `005_pme_role.sql` 之後執行，執行前 PME 仍以現行帳號運作。
