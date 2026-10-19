@@ -23,6 +23,8 @@
 | `020_calc_state.sql` | 🆕 v3.3：`calculated_points.calc_state`（累計函式的狀態，重啟後接續） | v3.3 升級必跑 |
 | `021_calc_scripts.sql` | 🆕 v3.4：`calculated_points.kind`（expression / python）、`last_log`（Python 腳本計算點） | v3.4 升級必跑 |
 | `022_unique_sensor_binding.sql` | 🆕 `opcua_tags` / `modbus_scada` / `tia_scada` 的 `sensor_id` 加上 UNIQUE（延遲到交易結束才檢查），資料庫層保證一個感測器只綁一個點位 | 建議跑；已有重複綁定時會失敗，先解除重複再跑 |
+| `023_pme_app_users_grant.sql` | 🆕 授權 PME 的 `pme` 帳號對 `app_users` 欄位層級 INSERT / UPDATE（不含 DELETE），供 PME 使用者管理頁使用。**前提：PME 的 `005_pme_role.sql` 已建立 `pme` 角色**（不存在會略過）。用 `-v pme_user=` 指定帳號 | 啟用 PME 使用者管理時，由 Eric 以擁有者身分執行 |
+| `023_rollback.sql` | 回滾 023，收回 `pme` 對 `app_users` 的 INSERT / UPDATE（**不是** migration） | ❌ 不要放進批次執行 |
 | `013_timeseries_policy.sql` | 🆕 **選用**：`sensor_readings` 啟用 TimescaleDB 壓縮（超過 30 天的 chunk 自動壓縮，不刪資料）。資料保留政策只寫在註解裡，需要時手動執行 | 確認後再跑，建議離峰時段 |
 
 ```bash
@@ -33,9 +35,9 @@ for f in 000_realtime_tables 001_sensor_hierarchy_and_mapping 006_opcua_upgrade 
          010_cumulative_counter_upload_condition 011_alarm_management 012_users_audit_status \
          014_reading_quality 015_modbus_transport 016_device_templates \
          017_calculated_points 018_report_schedules 019_s7_extensions 020_calc_state 021_calc_scripts \
-         022_unique_sensor_binding; do
+         022_unique_sensor_binding 023_pme_app_users_grant; do   # 不要加 023_rollback
   psql -h "$DB_HOST" -U <資料表擁有者> -d "$DB_NAME" -v ON_ERROR_STOP=1 \
-       -v app_user="$DB_USER" -f "sql/$f.sql" || break
+       -v app_user="$DB_USER" -v pme_user=pme -f "sql/$f.sql" || break
 done
 ```
 
@@ -97,5 +99,6 @@ migration 需要用**資料表擁有者**執行（目前是 `eric`）。應用�
 | `tia_scada.area` / `bit_offset` / `rack` / `slot` / `enabled` / `unit` | `019` |
 | `calculated_points.calc_state` | `020` |
 | `calculated_points.kind` / `last_log` | `021` |
+| `pme` 對 `app_users` 的欄位層級寫入權限 | `023` |
 
 這樣同一個欄位不會有兩個定義來源，改的時候不用擔心兩邊不同步。
