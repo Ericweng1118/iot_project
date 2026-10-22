@@ -25,6 +25,7 @@
 | `022_unique_sensor_binding.sql` | 🆕 `opcua_tags` / `modbus_scada` / `tia_scada` 的 `sensor_id` 加上 UNIQUE（延遲到交易結束才檢查），資料庫層保證一個感測器只綁一個點位 | 建議跑；已有重複綁定時會失敗，先解除重複再跑 |
 | `023_pme_app_users_grant.sql` | 🆕 授權 PME 的 `pme` 帳號對 `app_users` 欄位層級 INSERT / UPDATE（不含 DELETE），供 PME 使用者管理頁使用。**前提：PME 的 `005_pme_role.sql` 已建立 `pme` 角色**（不存在會略過）。用 `-v pme_user=` 指定帳號 | 啟用 PME 使用者管理時，由 Eric 以擁有者身分執行 |
 | `023_rollback.sql` | 回滾 023，收回 `pme` 對 `app_users` 的 INSERT / UPDATE（**不是** migration） | ❌ 不要放進批次執行 |
+| `024_table_column_comments.sql` | 🆕 補齊 000～023 漏掉的表、欄位、索引 `COMMENT ON`（中文用途、單位、來源；共用表註明 PME 依賴）。只有註解，不動結構與資料，可重複執行 | 擁有者執行一次即可 |
 | `013_timeseries_policy.sql` | 🆕 **選用**：`sensor_readings` 啟用 TimescaleDB 壓縮（超過 30 天的 chunk 自動壓縮，不刪資料）。資料保留政策只寫在註解裡，需要時手動執行 | 確認後再跑，建議離峰時段 |
 
 ```bash
@@ -35,7 +36,8 @@ for f in 000_realtime_tables 001_sensor_hierarchy_and_mapping 006_opcua_upgrade 
          010_cumulative_counter_upload_condition 011_alarm_management 012_users_audit_status \
          014_reading_quality 015_modbus_transport 016_device_templates \
          017_calculated_points 018_report_schedules 019_s7_extensions 020_calc_state 021_calc_scripts \
-         022_unique_sensor_binding 023_pme_app_users_grant; do   # 不要加 023_rollback
+         022_unique_sensor_binding 023_pme_app_users_grant \
+         024_table_column_comments; do   # 不要加 023_rollback
   psql -h "$DB_HOST" -U <資料表擁有者> -d "$DB_NAME" -v ON_ERROR_STOP=1 \
        -v app_user="$DB_USER" -v pme_user=pme -f "sql/$f.sql" || break
 done
