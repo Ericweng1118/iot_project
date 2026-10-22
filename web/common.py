@@ -16,7 +16,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from core.audit import audit
+from core.audit import audit, audit_in_tx
 from core.auth import ROLE_LABELS, has_role
 from core.config import LOCAL_TZ, MODBUS_ENABLED, OPCUA_ENABLED, TIA_ENABLED, now_local  # noqa: F401  (給各分頁 import)
 from data_layer.db_connector import DatabaseConnector
@@ -52,6 +52,11 @@ def require_role(role: str) -> None:
 def audit_ui(action: str, target: str | None = None, detail=None) -> None:
     """以目前登入者的身分寫一筆稽核紀錄（失敗不影響原本操作）。"""
     audit(current_user()["username"], action, target, detail)
+
+
+def audit_ui_tx(cur, action: str, target: str | None = None, detail=None) -> None:
+    """同 audit_ui，但寫在呼叫端的交易裡；寫不進去就丟例外，設定變更跟著回滾（見 core/audit.py）。"""
+    audit_in_tx(cur, current_user()["username"], action, target, detail)
 
 
 # ------------------------------------------------------------------

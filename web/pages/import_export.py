@@ -22,7 +22,7 @@ from data_layer.import_templates import build_template
 from data_layer.db_connector import DatabaseConnector
 from web.common import (
     OPCUA_ENABLED,
-    audit_ui,
+    audit_ui_tx,
     now_local,
     require_role,
     table_exists,
@@ -204,8 +204,10 @@ def _plan(entity, df):
             return bulk_io.plan_import(cur, entity, df)
 
 
-def _apply(entity, df, expected):
-    """在同一個交易裡重新驗證後套用：預覽之後資料庫若被別人改過，數字不同就不套用。"""
+def _apply(entity, df, expected, file_name):
+    """在同一個交易裡重新驗證後套用：預覽之後資料庫若被別人改過，數字不同就不套用。
+    稽核也寫在同一個交易：import.modbus / import.s7 可能改倍率，PME 依此重新起算累計值，
+    稽核寫不進去就整批不套用（見 core/audit.py）。"""
     with DatabaseConnector.get_connection() as conn:
         with conn.cursor() as cur:
             plan = bulk_io.plan_import(cur, entity, df)
@@ -214,6 +216,18 @@ def _apply(entity, df, expected):
             if (len(plan.inserts), len(plan.updates)) != expected:
                 raise ValueError("預覽之後資料庫內容有變動，請重新上傳檔案再確認一次")
             result = bulk_io.apply_plan(cur, plan)
+            audit_ui_tx(
+                cur,
+                f"import.{entity}",
+                entity,
+                {
+                    "file": file_name,
+                    **result,
+                    "keys": [c.key for c in plan.changes][:200],
+                    "sensor_ids": bulk_io.affected_sensor_ids(plan),
+                    "diffs": {c.key: c.diff for c in plan.updates[:200]},
+                },
+            )
     return plan, result
 
 
@@ -331,21 +345,12 @@ def _render_entity(entity):
         key=f"ie_apply_{entity}",
     ):
         try:
-            applied, result = _apply(entity, df, (len(plan.inserts), len(plan.updates)))
+            _, result = _apply(
+                entity, df, (len(plan.inserts), len(plan.updates)), uploaded.name
+            )
         except Exception as e:
             st.error(f"❌ 套用失敗，沒有寫入任何資料：{e}")
             return
-        audit_ui(
-            f"import.{entity}",
-            entity,
-            {
-                "file": uploaded.name,
-                **result,
-                "keys": [c.key for c in applied.changes][:200],
-                "sensor_ids": bulk_io.affected_sensor_ids(applied),
-                "diffs": {c.key: c.diff for c in applied.updates[:200]},
-            },
-        )
         st.session_state[f"ie_nonce_{entity}"] = nonce + 1  # 清掉上傳的檔案
         st.session_state.pop(f"ie_export_{entity}", None)
         done = f"✅ {spec['label']}：新增 {result['inserted']} 筆、更新 {result['updated']} 筆"

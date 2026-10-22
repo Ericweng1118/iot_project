@@ -21,6 +21,7 @@ from web.common import (
     _sensor_select_options,
     attach_sensor_ids,
     audit_ui,
+    audit_ui_tx,
     frame_changes,
     require_role,
 )
@@ -315,15 +316,19 @@ def render():
                                         point_id,
                                     ),
                                 )
+                        # 稽核與設定變更同一個交易：PME 依此偵測倍率 / data_type 變更，漏寫會算出假的用量暴增
+                        audit_ui_tx(
+                            cur,
+                            "modbus.update",
+                            "modbus_scada",
+                            attach_sensor_ids(
+                                frame_changes(
+                                    df_modbus_display, edited_modbus_df, "id"
+                                ),
+                                df_modbus,
+                            ),
+                        )
                         conn.commit()
-                audit_ui(
-                    "modbus.update",
-                    "modbus_scada",
-                    attach_sensor_ids(
-                        frame_changes(df_modbus_display, edited_modbus_df, "id"),
-                        df_modbus,
-                    ),
-                )
                 st.success("✅ Modbus 點位參數更新成功！")
                 st.rerun()
             except Exception as e:

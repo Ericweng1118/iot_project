@@ -31,6 +31,7 @@ import pandas as pd
 import streamlit as st
 
 from core.config import MODBUS_ENABLED, env_bool
+from data_layer.db_connector import DatabaseConnector
 from protocols.modbus_codec import (
     BIT_FUNCTIONS,
     DATA_TYPES,
@@ -58,6 +59,7 @@ from web.common import (
     _load_sensor_options,
     _sensor_select_options,
     audit_ui,
+    audit_ui_tx,
     column_exists,
     execute,
     fetch_df,
@@ -741,30 +743,32 @@ def _tab_verify():
         if c3.form_submit_button("套用", type="primary"):
             bo, wo = ORDER_PRESETS[order]
             old = next(r["目前順序"] for r in rows if r["id"] == tag_id)
-            execute(
-                "UPDATE modbus_scada SET byte_order=%s, word_order=%s WHERE id=%s;",
-                (bo, wo, int(tag_id)),
-            )
-            # 補上綁定的 sensor_id：PME 依此判斷哪個計量點的數值從這一刻起換了解讀方式
-            bound = fetch_df(
-                "SELECT sensor_id FROM modbus_scada WHERE id = %s;",
-                (int(tag_id),),
-                show_error=False,
-            )
-            sensor_id = (
-                None
-                if bound.empty or pd.isnull(bound.iloc[0]["sensor_id"])
-                else int(bound.iloc[0]["sensor_id"])
-            )
-            audit_ui(
-                "modbus.update",
-                f"modbus:{tag_id}",
-                {
-                    "byte/word order": [old, order],
-                    "source": "線上調適",
-                    "sensor_id": sensor_id,
-                },
-            )
+            # 更新、查綁定、寫稽核在同一個交易：PME 依稽核的 sensor_id 判斷哪個計量點從這一刻起換了解讀方式，
+            # 稽核寫不進去就連同更新一起回滾（見 core/audit.py）
+            try:
+                with DatabaseConnector.get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE modbus_scada SET byte_order=%s, word_order=%s WHERE id=%s RETURNING sensor_id;",
+                            (bo, wo, int(tag_id)),
+                        )
+                        bound = cur.fetchone()
+                        sensor_id = (
+                            int(bound[0]) if bound and bound[0] is not None else None
+                        )
+                        audit_ui_tx(
+                            cur,
+                            "modbus.update",
+                            f"modbus:{tag_id}",
+                            {
+                                "byte/word order": [old, order],
+                                "source": "線上調適",
+                                "sensor_id": sensor_id,
+                            },
+                        )
+            except Exception as e:
+                st.error(f"❌ 套用失敗，位元組順序沒有變更：{e}")
+                return
             st.success(
                 f"✅ 已將點位 #{tag_id} 改為 {order}（{bo}/{wo}），下一輪採集生效。"
             )

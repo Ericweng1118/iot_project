@@ -28,3 +28,34 @@ def test_attach_sensor_ids_skips_non_row_entries():
     assert attach_sensor_ids({"note": "無法比對"}, before) == {"note": "無法比對"}
     assert attach_sensor_ids({"_truncated": True}, before) == {"_truncated": True}
     assert attach_sensor_ids({"1": {"x": [1, 2]}}, before.drop(columns=["sensor_id"])) == {"1": {"x": [1, 2]}}
+
+
+class _FakeCursor:
+    def __init__(self, fail=False):
+        self.fail, self.calls = fail, []
+
+    def execute(self, sql, params):
+        if self.fail:
+            raise RuntimeError("permission denied for table audit_log")
+        self.calls.append((sql, params))
+
+
+def test_audit_in_tx_writes_on_callers_cursor():
+    from core.audit import audit_in_tx
+
+    cur = _FakeCursor()
+    audit_in_tx(cur, "alice", "modbus.update", "modbus_scada", {"1": {"eng_max": [100, 150], "sensor_id": 11}})
+    sql, params = cur.calls[0]
+    assert sql.startswith("INSERT INTO audit_log")
+    assert params[:3] == ("alice", "modbus.update", "modbus_scada")
+    assert '"sensor_id": 11' in params[3]
+
+
+def test_audit_in_tx_raises_so_config_change_rolls_back():
+    # 與 audit() 不同：失敗不能吞掉，否則設定改了 PME 卻看不到（見 core/audit.py）
+    import pytest
+
+    from core.audit import audit_in_tx
+
+    with pytest.raises(RuntimeError):
+        audit_in_tx(_FakeCursor(fail=True), "alice", "tia.update", "tia_scada", None)

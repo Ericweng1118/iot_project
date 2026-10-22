@@ -26,6 +26,7 @@ from web.common import (
     _sensor_select_options,
     attach_sensor_ids,
     audit_ui,
+    audit_ui_tx,
     column_exists,
     execute,
     fmt_age,
@@ -244,14 +245,17 @@ def render():
                                         point_id,
                                     ),
                                 )
+                        # 稽核與設定變更同一個交易：PME 依此偵測 data_type 變更，漏寫會算出假的用量暴增
+                        audit_ui_tx(
+                            cur,
+                            "tia.update",
+                            "tia_scada",
+                            attach_sensor_ids(
+                                frame_changes(df_tia_display, edited_tia_df, "id"),
+                                df_tia,
+                            ),
+                        )
                         conn.commit()
-                audit_ui(
-                    "tia.update",
-                    "tia_scada",
-                    attach_sensor_ids(
-                        frame_changes(df_tia_display, edited_tia_df, "id"), df_tia
-                    ),
-                )
                 st.success("✅ TIA 點位參數更新成功！")
                 st.rerun()
             except Exception as e:

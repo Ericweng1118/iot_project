@@ -111,6 +111,8 @@ SCADA 網頁修改設定時都會寫 `audit_log`，`audit_log.ts` 就是生效�
 | `import.<entity>` | `{"keys": […], "diffs": {…}, "sensor_ids": [受影響的既有 sensor_id]}` | 批次匯入（`sensors` / `modbus` / `s7` / `opcua_bindings` 才有 `sensor_ids`） |
 
 `sensor_id` 是**變更前**綁定的感測器；綁定本身有改時，新的綁定會出現在該列的 diff 裡（`sensor_label` 或 `sensor_id` 欄）。
+`modbus.update`（含線上調適）、`tia.update`、`import.<entity>` 的稽核與設定變更寫在**同一個交易**（`core/audit.py` 的 `audit_in_tx`）：稽核寫不進去，設定變更就一起回滾，不會有「改了但 PME 看不到」的情況。
+`sensor.update` 及其他事件仍是 commit 之後另外寫（寫入失敗只記 log），漏寫只會少一筆標示，不影響倍率 rebase。
 直接用 pgAdmin / 腳本改資料庫不會留稽核紀錄，這類變更仍依第 5 節規則人工通知。
 
 ## 4. 增量讀取建議
