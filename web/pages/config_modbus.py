@@ -41,10 +41,26 @@ from web.common import column_exists, execute, fmt_age, get_service_status
 # ------------------------------------------------------------------
 # 即時測試讀取（不寫入 DB）：v3.1 改用與採集程式相同的連線類別與解碼，支援三種傳輸方式
 # ------------------------------------------------------------------
-def test_modbus_read(ip, port, slave_id, function_code, start_address, data_type, byte_order,
-                     word_order, use_scale=False, raw_min=0.0, raw_max=10000.0, eng_min=0.0,
-                     eng_max=10000.0, transport="tcp", serial_settings=None):
-    conn = ModbusConnection(transport, ip, int(port), timeout=3, serial_settings=serial_settings)
+def test_modbus_read(
+    ip,
+    port,
+    slave_id,
+    function_code,
+    start_address,
+    data_type,
+    byte_order,
+    word_order,
+    use_scale=False,
+    raw_min=0.0,
+    raw_max=10000.0,
+    eng_min=0.0,
+    eng_max=10000.0,
+    transport="tcp",
+    serial_settings=None,
+):
+    conn = ModbusConnection(
+        transport, ip, int(port), timeout=3, serial_settings=serial_settings
+    )
     try:
         count = 1 if int(function_code) in BIT_FUNCTIONS else register_count(data_type)
         res = conn.read(int(function_code), int(start_address), count, int(slave_id))
@@ -55,11 +71,17 @@ def test_modbus_read(ip, port, slave_id, function_code, start_address, data_type
     raw = decode(res.values, data_type, byte_order, word_order)
     msg = f"✅ 讀取成功（{res.elapsed_ms:.0f} ms）｜原始暫存器：{res.values}｜解碼值：{raw}"
     if use_scale:
-        msg += f"｜工程值：{apply_linear_scaling(raw, raw_min, raw_max, eng_min, eng_max)}"
+        msg += (
+            f"｜工程值：{apply_linear_scaling(raw, raw_min, raw_max, eng_min, eng_max)}"
+        )
     if count >= 2:
-        alts = {name: decode(res.values, data_type, bo, wo) for name, (bo, wo) in ORDER_PRESETS.items()}
-        msg += "｜四種位元組順序對照：" + "、".join(f"{k}={v:.6g}" if v is not None else f"{k}=—"
-                                                   for k, v in alts.items())
+        alts = {
+            name: decode(res.values, data_type, bo, wo)
+            for name, (bo, wo) in ORDER_PRESETS.items()
+        }
+        msg += "｜四種位元組順序對照：" + "、".join(
+            f"{k}={v:.6g}" if v is not None else f"{k}=—" for k, v in alts.items()
+        )
     return True, msg
 
 
@@ -69,11 +91,17 @@ def render():
     has_v31 = column_exists("modbus_scada", "transport")
     extra_cols = ", transport, serial_settings, enabled" if has_v31 else ""
     if not has_v31:
-        st.info("尚未執行 `sql/015_modbus_transport.sql`：目前只支援 Modbus TCP，也無法個別停用點位。")
+        st.info(
+            "尚未執行 `sql/015_modbus_transport.sql`：目前只支援 Modbus TCP，也無法個別停用點位。"
+        )
 
     debug_page = nav.get("modbus-debug")
     if debug_page:
-        st.page_link(debug_page, label="開啟 Modbus 線上調適工具（讀暫存器、比對位元組順序、掃描站號）", icon="🔧")
+        st.page_link(
+            debug_page,
+            label="開啟 Modbus 線上調適工具（讀暫存器、比對位元組順序、掃描站號）",
+            icon="🔧",
+        )
     _render_poll_stats()
 
     def load_modbus_tags():
@@ -103,7 +131,9 @@ def render():
     # 放在分頁層級（不是 if not df.empty 裡面），因為下方的「單筆新增」表單也要用，
     # 表格為空時仍必須有值可用。
     modbus_binding_map = _load_sensor_binding_map()
-    modbus_free_options, _ = _sensor_select_options(modbus_label_to_id, modbus_binding_map)
+    modbus_free_options, _ = _sensor_select_options(
+        modbus_label_to_id, modbus_binding_map
+    )
 
     st.subheader("📋 Modbus 點位列表（可直接於表格內修改參數）")
     st.caption(
@@ -114,9 +144,11 @@ def render():
         # 把 sensor_id 轉成人類可讀的 sensor_label 欄位，供下拉選單編輯，
         # 存檔時再反查回 sensor_id。
         df_modbus["sensor_label"] = df_modbus["sensor_id"].apply(
-            lambda sid: modbus_id_to_label.get(int(sid), UNBOUND_LABEL)
-            if pd.notnull(sid)
-            else UNBOUND_LABEL
+            lambda sid: (
+                modbus_id_to_label.get(int(sid), UNBOUND_LABEL)
+                if pd.notnull(sid)
+                else UNBOUND_LABEL
+            )
         )
         df_modbus_display = df_modbus.drop(columns=["sensor_id"])
 
@@ -152,24 +184,40 @@ def render():
             width="stretch",
             column_config={
                 "transport": st.column_config.SelectboxColumn(
-                    "傳輸方式", options=list(TRANSPORTS), required=True,
+                    "傳輸方式",
+                    options=list(TRANSPORTS),
+                    required=True,
                     help="tcp=Modbus TCP｜rtu_over_tcp=序列閘道透通模式｜rtu=本機序列埠（plc_ip 填 /dev/ttyUSB0）",
                 ),
                 "serial_settings": st.column_config.TextColumn(
-                    "序列埠參數", help="transport=rtu 時填「鮑率,資料位元,同位,停止位元」，例如 9600,8,N,1"),
-                "enabled": st.column_config.CheckboxColumn("採集", help="取消勾選 = 暫停採集這個點位"),
-                "function_code": st.column_config.SelectboxColumn("功能碼", options=[1, 2, 3, 4], required=True),
+                    "序列埠參數",
+                    help="transport=rtu 時填「鮑率,資料位元,同位,停止位元」，例如 9600,8,N,1",
+                ),
+                "enabled": st.column_config.CheckboxColumn(
+                    "採集", help="取消勾選 = 暫停採集這個點位"
+                ),
+                "function_code": st.column_config.SelectboxColumn(
+                    "功能碼", options=[1, 2, 3, 4], required=True
+                ),
                 "data_type": st.column_config.SelectboxColumn(
-                    "資料型態", options=sorted(set(DATA_TYPES) | {"word", "int", "dint", "float", "double"}),
-                    required=True),
-                "byte_order": st.column_config.SelectboxColumn("byte_order", options=["BIG", "LITTLE"], required=True),
-                "word_order": st.column_config.SelectboxColumn("word_order", options=["BIG", "LITTLE"], required=True),
+                    "資料型態",
+                    options=sorted(
+                        set(DATA_TYPES) | {"word", "int", "dint", "float", "double"}
+                    ),
+                    required=True,
+                ),
+                "byte_order": st.column_config.SelectboxColumn(
+                    "byte_order", options=["BIG", "LITTLE"], required=True
+                ),
+                "word_order": st.column_config.SelectboxColumn(
+                    "word_order", options=["BIG", "LITTLE"], required=True
+                ),
                 "sensor_label": st.column_config.SelectboxColumn(
                     "綁定感測器 (sensor_code)",
                     options=modbus_options,
                     help="只列出尚未被其他點位綁定的感測器。"
                     "選單內容請先在「感測器階層管理」分頁建立。",
-                )
+                ),
             },
         )
 
@@ -213,11 +261,15 @@ def render():
                                     cur.execute(
                                         "UPDATE modbus_scada SET transport=%s, serial_settings=%s, enabled=%s "
                                         "WHERE id=%s;",
-                                        (row["transport"] or "tcp",
-                                         str(row["serial_settings"]).strip()
-                                         if pd.notnull(row["serial_settings"]) and str(row["serial_settings"]).strip()
-                                         else None,
-                                         bool(row["enabled"]), point_id),
+                                        (
+                                            row["transport"] or "tcp",
+                                            str(row["serial_settings"]).strip()
+                                            if pd.notnull(row["serial_settings"])
+                                            and str(row["serial_settings"]).strip()
+                                            else None,
+                                            bool(row["enabled"]),
+                                            point_id,
+                                        ),
                                     )
                                 sql = """
                                 UPDATE modbus_scada SET
@@ -256,15 +308,22 @@ def render():
                                         # unit 原本漏掉沒帶進 UPDATE：欄位在表格裡可以編輯、
                                         # 存檔也會顯示成功，但值其實從來沒被寫回去
                                         str(row["unit"]).strip()
-                                        if pd.notnull(row["unit"]) and str(row["unit"]).strip()
+                                        if pd.notnull(row["unit"])
+                                        and str(row["unit"]).strip()
                                         else None,
                                         sensor_id,
                                         point_id,
                                     ),
                                 )
                         conn.commit()
-                audit_ui("modbus.update", "modbus_scada",
-                         attach_sensor_ids(frame_changes(df_modbus_display, edited_modbus_df, "id"), df_modbus))
+                audit_ui(
+                    "modbus.update",
+                    "modbus_scada",
+                    attach_sensor_ids(
+                        frame_changes(df_modbus_display, edited_modbus_df, "id"),
+                        df_modbus,
+                    ),
+                )
                 st.success("✅ Modbus 點位參數更新成功！")
                 st.rerun()
             except Exception as e:
@@ -276,13 +335,27 @@ def render():
         col1, col2, col3 = st.columns(3)
         with col1:
             m_name = st.text_input("點位名稱 (name)", "Test")
-            m_transport = st.selectbox(
-                "傳輸方式", list(TRANSPORTS), format_func=TRANSPORTS.get,
-                disabled=not has_v31, help="需要 sql/015；未執行時固定為 Modbus TCP",
-            ) if has_v31 else "tcp"
-            m_plc_ip = st.text_input("IP 地址 / 序列埠路徑 (plc_ip)", "192.168.1.1",
-                                     help="傳輸方式為「RTU 序列埠」時填 /dev/ttyUSB0 之類的路徑")
-            m_serial = st.text_input("序列埠參數（僅 RTU 序列埠）", "9600,8,N,1") if has_v31 else None
+            m_transport = (
+                st.selectbox(
+                    "傳輸方式",
+                    list(TRANSPORTS),
+                    format_func=TRANSPORTS.get,
+                    disabled=not has_v31,
+                    help="需要 sql/015；未執行時固定為 Modbus TCP",
+                )
+                if has_v31
+                else "tcp"
+            )
+            m_plc_ip = st.text_input(
+                "IP 地址 / 序列埠路徑 (plc_ip)",
+                "192.168.1.1",
+                help="傳輸方式為「RTU 序列埠」時填 /dev/ttyUSB0 之類的路徑",
+            )
+            m_serial = (
+                st.text_input("序列埠參數（僅 RTU 序列埠）", "9600,8,N,1")
+                if has_v31
+                else None
+            )
             m_plc_port = st.number_input("Modbus 埠號 (plc_port)", value=502)
             m_slave_id = st.number_input(
                 "從站 ID (slave_id)", value=1, min_value=1, max_value=247
@@ -412,28 +485,33 @@ def render():
                             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OFFLINE');
                             """
                             if has_v31:
-                                sql = sql.replace("sensor_id, plc_state", "sensor_id, plc_state, transport, serial_settings") \
-                                         .replace("'OFFLINE');", "'OFFLINE', %s, %s);")
+                                sql = sql.replace(
+                                    "sensor_id, plc_state",
+                                    "sensor_id, plc_state, transport, serial_settings",
+                                ).replace("'OFFLINE');", "'OFFLINE', %s, %s);")
                             params = (
-                                    m_name,
-                                    m_plc_ip,
-                                    int(m_plc_port),
-                                    int(m_slave_id),
-                                    int(m_function_code),
-                                    int(m_start_address),
-                                    m_data_type,
-                                    m_byte_order,
-                                    m_word_order,
-                                    m_raw_min if m_use_scale else None,
-                                    m_raw_max if m_use_scale else None,
-                                    m_eng_min if m_use_scale else None,
-                                    m_eng_max if m_use_scale else None,
-                                    formatted_state_dict,
-                                    m_unit,
-                                    new_sensor_id,
+                                m_name,
+                                m_plc_ip,
+                                int(m_plc_port),
+                                int(m_slave_id),
+                                int(m_function_code),
+                                int(m_start_address),
+                                m_data_type,
+                                m_byte_order,
+                                m_word_order,
+                                m_raw_min if m_use_scale else None,
+                                m_raw_max if m_use_scale else None,
+                                m_eng_min if m_use_scale else None,
+                                m_eng_max if m_use_scale else None,
+                                formatted_state_dict,
+                                m_unit,
+                                new_sensor_id,
                             )
                             if has_v31:
-                                params += (m_transport, m_serial if m_transport == "rtu" else None)
+                                params += (
+                                    m_transport,
+                                    m_serial if m_transport == "rtu" else None,
+                                )
                             cur.execute(sql, params)
                             conn.commit()
                     audit_ui("modbus.create", f"modbus:{m_name}")
@@ -450,22 +528,38 @@ def render():
 def _render_poll_stats():
     """main.py 回報的各條連線採集統計（需要 sql/012，且 MODBUS_ENABLED=true）。"""
     svc = get_service_status()
-    stats = ((svc or {}).get("info") or {}).get("modbus") if svc and svc.get("exists") else None
+    stats = (
+        ((svc or {}).get("info") or {}).get("modbus")
+        if svc and svc.get("exists")
+        else None
+    )
     if not stats:
         return
-    rows = [{
-        "連線": label,
-        "狀態": {"ONLINE": "🟢 正常", "PARTIAL": "🟡 部分失敗", "OFFLINE": "🔴 離線"}.get(v.get("state"), v.get("state")),
-        "點位（成功/總數）": f"{v.get('ok_tags', 0)} / {v.get('tags', 0)}",
-        "區塊數": v.get("blocks"),
-        "請求數": v.get("requests"),
-        "耗時 ms": v.get("last_cycle_ms"),
-        "單獨讀取的點位": v.get("isolated_tags"),
-        "最後錯誤": v.get("last_error") or "",
-    } for label, v in stats.items()]
-    with st.expander(f"📈 採集狀況（每條連線，最後回報 {fmt_age(svc['age_seconds'])}）", expanded=False):
-        st.caption("同一個閘道後面的多個站號共用一條連線；相近位址合併成一個區塊一次讀取。"
-                   "「單獨讀取的點位」是曾經讓整塊讀取失敗、之後改成獨立讀取的點位，建議用線上調適工具確認位址。")
+    rows = [
+        {
+            "連線": label,
+            "狀態": {
+                "ONLINE": "🟢 正常",
+                "PARTIAL": "🟡 部分失敗",
+                "OFFLINE": "🔴 離線",
+            }.get(v.get("state"), v.get("state")),
+            "點位（成功/總數）": f"{v.get('ok_tags', 0)} / {v.get('tags', 0)}",
+            "區塊數": v.get("blocks"),
+            "請求數": v.get("requests"),
+            "耗時 ms": v.get("last_cycle_ms"),
+            "單獨讀取的點位": v.get("isolated_tags"),
+            "最後錯誤": v.get("last_error") or "",
+        }
+        for label, v in stats.items()
+    ]
+    with st.expander(
+        f"📈 採集狀況（每條連線，最後回報 {fmt_age(svc['age_seconds'])}）",
+        expanded=False,
+    ):
+        st.caption(
+            "同一個閘道後面的多個站號共用一條連線；相近位址合併成一個區塊一次讀取。"
+            "「單獨讀取的點位」是曾經讓整塊讀取失敗、之後改成獨立讀取的點位，建議用線上調適工具確認位址。"
+        )
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 
@@ -474,17 +568,36 @@ def _render_delete(df_modbus: pd.DataFrame):
         return
     st.divider()
     with st.expander("🗑️ 刪除點位"):
-        labels = {int(r["id"]): f"#{int(r['id'])} {r['name']}（{r['plc_ip']} / 站號 {r['slave_id']} / "
-                                f"FC{int(r['function_code']):02d} @ {int(r['start_address'])}）"
-                  for _, r in df_modbus.iterrows()}
-        chosen = st.multiselect("選擇要刪除的點位", list(labels), format_func=labels.get, key="mb_del")
-        st.caption("只會刪除點位設定；已寫入 sensor_readings 的歷史資料會保留（屬於感測器，不屬於點位）。"
-                   "只是暫停採集的話，取消表格中的「採集」勾選即可。")
-        confirm = st.checkbox(f"我確定要刪除這 {len(chosen)} 個點位", key="mb_del_confirm", disabled=not chosen)
+        labels = {
+            int(
+                r["id"]
+            ): f"#{int(r['id'])} {r['name']}（{r['plc_ip']} / 站號 {r['slave_id']} / "
+            f"FC{int(r['function_code']):02d} @ {int(r['start_address'])}）"
+            for _, r in df_modbus.iterrows()
+        }
+        chosen = st.multiselect(
+            "選擇要刪除的點位", list(labels), format_func=labels.get, key="mb_del"
+        )
+        st.caption(
+            "只會刪除點位設定；已寫入 sensor_readings 的歷史資料會保留（屬於感測器，不屬於點位）。"
+            "只是暫停採集的話，取消表格中的「採集」勾選即可。"
+        )
+        confirm = st.checkbox(
+            f"我確定要刪除這 {len(chosen)} 個點位",
+            key="mb_del_confirm",
+            disabled=not chosen,
+        )
         if st.button("刪除", disabled=not (chosen and confirm), key="mb_del_btn"):
             try:
-                n = execute("DELETE FROM modbus_scada WHERE id = ANY(%s);", ([int(i) for i in chosen],))
-                audit_ui("modbus.delete", "modbus_scada", {"ids": chosen, "names": [labels[i] for i in chosen]})
+                n = execute(
+                    "DELETE FROM modbus_scada WHERE id = ANY(%s);",
+                    ([int(i) for i in chosen],),
+                )
+                audit_ui(
+                    "modbus.delete",
+                    "modbus_scada",
+                    {"ids": chosen, "names": [labels[i] for i in chosen]},
+                )
                 st.success(f"✅ 已刪除 {n} 個點位")
                 st.rerun()
             except Exception as e:

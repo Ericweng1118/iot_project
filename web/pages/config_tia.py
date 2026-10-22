@@ -50,14 +50,19 @@ def test_tia_read(ip, db_number, offset, data_type, rack=0, slot=1, area="DB", b
         res = conn.read(area, int(db_number or 0), int(offset), size)
     finally:
         conn.close()
-    address = C.format_address(area, int(db_number or 0), int(offset), data_type, int(bit))
+    address = C.format_address(
+        area, int(db_number or 0), int(offset), data_type, int(bit)
+    )
     if not res.ok:
         return False, f"❌ {address} 讀取失敗（{res.elapsed_ms:.0f} ms）：{res.error}"
     try:
         value = C.decode(res.data, 0, data_type, int(bit))
     except ValueError as e:
         return False, f"❌ 解析失敗：{e}"
-    return True, f"🎉 {address} = `{value}`（原始 {res.data.hex(' ').upper()}，回應 {res.elapsed_ms:.0f} ms）"
+    return (
+        True,
+        f"🎉 {address} = `{value}`（原始 {res.data.hex(' ').upper()}，回應 {res.elapsed_ms:.0f} ms）",
+    )
 
 
 def render():
@@ -65,10 +70,16 @@ def render():
     st.header("📡 Siemens TIA (S7) 點位配置")
     v33 = column_exists("tia_scada", "area")
     if not v33:
-        st.info("尚未執行 `sql/019_s7_extensions.sql`：目前只能讀 DB 區域、BOOL 只能讀第 0 bit、Rack/Slot 固定 0/1。")
+        st.info(
+            "尚未執行 `sql/019_s7_extensions.sql`：目前只能讀 DB 區域、BOOL 只能讀第 0 bit、Rack/Slot 固定 0/1。"
+        )
     debug_page = nav.get("s7-debug")
     if debug_page:
-        st.page_link(debug_page, label="開啟 S7 線上調適工具（CPU 資訊、讀記憶體找 offset、驗證點位）", icon="🔧")
+        st.page_link(
+            debug_page,
+            label="開啟 S7 線上調適工具（CPU 資訊、讀記憶體找 offset、驗證點位）",
+            icon="🔧",
+        )
     _render_poll_stats()
 
     def load_tia_tags():
@@ -81,7 +92,11 @@ def render():
                         sensor_id, plc_state, current_data, last_update
                     FROM tia_scada
                     ORDER BY id ASC;
-                    """.format(extra="rack, slot, area, bit_offset, unit, enabled," if v33 else "")
+                    """.format(
+                        extra="rack, slot, area, bit_offset, unit, enabled,"
+                        if v33
+                        else ""
+                    )
                     cur.execute(query)
                     cols = [desc[0] for desc in cur.description]
                     rows = cur.fetchall()
@@ -105,9 +120,11 @@ def render():
     )
     if not df_tia.empty:
         df_tia["sensor_label"] = df_tia["sensor_id"].apply(
-            lambda sid: tia_id_to_label.get(int(sid), UNBOUND_LABEL)
-            if pd.notnull(sid)
-            else UNBOUND_LABEL
+            lambda sid: (
+                tia_id_to_label.get(int(sid), UNBOUND_LABEL)
+                if pd.notnull(sid)
+                else UNBOUND_LABEL
+            )
         )
         df_tia_display = df_tia.drop(columns=["sensor_id"])
 
@@ -134,20 +151,32 @@ def render():
             disabled=disabled_cols_tia,
             width="stretch",
             column_config={
-                "area": st.column_config.SelectboxColumn("區域", options=list(C.AREAS), required=True),
-                "data_type": st.column_config.SelectboxColumn("資料型態", options=TYPE_OPTIONS, required=True),
-                "bit_offset": st.column_config.NumberColumn("bit", min_value=0, max_value=7,
-                                                            help="BOOL 的位元 0~7，例如 DBX10.3 填 3"),
+                "area": st.column_config.SelectboxColumn(
+                    "區域", options=list(C.AREAS), required=True
+                ),
+                "data_type": st.column_config.SelectboxColumn(
+                    "資料型態", options=TYPE_OPTIONS, required=True
+                ),
+                "bit_offset": st.column_config.NumberColumn(
+                    "bit",
+                    min_value=0,
+                    max_value=7,
+                    help="BOOL 的位元 0~7，例如 DBX10.3 填 3",
+                ),
                 "rack": st.column_config.NumberColumn("Rack", min_value=0, max_value=7),
-                "slot": st.column_config.NumberColumn("Slot", min_value=0, max_value=31,
-                                                      help="S7-1200/1500 = 1，S7-300 = 2"),
+                "slot": st.column_config.NumberColumn(
+                    "Slot",
+                    min_value=0,
+                    max_value=31,
+                    help="S7-1200/1500 = 1，S7-300 = 2",
+                ),
                 "enabled": st.column_config.CheckboxColumn("採集"),
                 "sensor_label": st.column_config.SelectboxColumn(
                     "綁定感測器 (sensor_code)",
                     options=tia_options,
                     help="只列出尚未被其他點位綁定的感測器。"
                     "選單內容請先在「感測器階層管理」分頁建立。",
-                )
+                ),
             },
         )
 
@@ -181,10 +210,20 @@ def render():
                                     cur.execute(
                                         "UPDATE tia_scada SET area=%s, bit_offset=%s, rack=%s, slot=%s, "
                                         "unit=%s, enabled=%s WHERE id=%s;",
-                                        (row["area"] or "DB", int(row["bit_offset"] or 0), int(row["rack"] or 0),
-                                         int(row["slot"]) if pd.notnull(row["slot"]) else 1,
-                                         str(row["unit"]).strip() if pd.notnull(row["unit"]) and str(row["unit"]).strip() else None,
-                                         bool(row["enabled"]), point_id),
+                                        (
+                                            row["area"] or "DB",
+                                            int(row["bit_offset"] or 0),
+                                            int(row["rack"] or 0),
+                                            int(row["slot"])
+                                            if pd.notnull(row["slot"])
+                                            else 1,
+                                            str(row["unit"]).strip()
+                                            if pd.notnull(row["unit"])
+                                            and str(row["unit"]).strip()
+                                            else None,
+                                            bool(row["enabled"]),
+                                            point_id,
+                                        ),
                                     )
                                 sql = """
                                 UPDATE tia_scada SET
@@ -206,8 +245,13 @@ def render():
                                     ),
                                 )
                         conn.commit()
-                audit_ui("tia.update", "tia_scada",
-                         attach_sensor_ids(frame_changes(df_tia_display, edited_tia_df, "id"), df_tia))
+                audit_ui(
+                    "tia.update",
+                    "tia_scada",
+                    attach_sensor_ids(
+                        frame_changes(df_tia_display, edited_tia_df, "id"), df_tia
+                    ),
+                )
                 st.success("✅ TIA 點位參數更新成功！")
                 st.rerun()
             except Exception as e:
@@ -216,8 +260,11 @@ def render():
     st.divider()
     st.subheader("➕ 單筆新增 TIA S7 點位")
     with st.form("add_tia_form", clear_on_submit=False):
-        quick = st.text_input("TIA 位址（選填，填了就以它為準）", placeholder="%DB1.DBD4、DB1.DBX10.3、MW20、I0.1",
-                              help="直接貼 TIA Portal 的位址，自動換算區域 / DB / byte / bit")
+        quick = st.text_input(
+            "TIA 位址（選填，填了就以它為準）",
+            placeholder="%DB1.DBD4、DB1.DBX10.3、MW20、I0.1",
+            help="直接貼 TIA Portal 的位址，自動換算區域 / DB / byte / bit",
+        )
         col1, col2, col3 = st.columns(3)
         with col1:
             t_name = st.text_input("點位名稱 (name)", "T3_PM:kW")
@@ -225,16 +272,32 @@ def render():
             t_plc_ip = st.text_input("PLC IP 地址 (plc_ip)", "192.168.1.200")
             t_unit = st.text_input("工程單位", "", disabled=not v33)
         with col2:
-            t_area = st.selectbox("區域", list(C.AREAS), format_func=C.AREAS.get, disabled=not v33)
-            t_db_number = st.number_input("DB 區塊號碼 (db_number)", value=1, min_value=0)
+            t_area = st.selectbox(
+                "區域", list(C.AREAS), format_func=C.AREAS.get, disabled=not v33
+            )
+            t_db_number = st.number_input(
+                "DB 區塊號碼 (db_number)", value=1, min_value=0
+            )
             t_offset = st.number_input("byte 偏移量 (offset)", value=0, min_value=0)
-            t_bit = st.number_input("bit（BOOL 用）", value=0, min_value=0, max_value=7, disabled=not v33)
+            t_bit = st.number_input(
+                "bit（BOOL 用）", value=0, min_value=0, max_value=7, disabled=not v33
+            )
         with col3:
-            t_data_type = st.selectbox("資料型態 (data_type)", TYPE_OPTIONS, index=TYPE_OPTIONS.index("REAL"))
+            t_data_type = st.selectbox(
+                "資料型態 (data_type)", TYPE_OPTIONS, index=TYPE_OPTIONS.index("REAL")
+            )
             r1, r2 = st.columns(2)
-            t_rack = r1.number_input("Rack", value=0, min_value=0, max_value=7, disabled=not v33)
-            t_slot = r2.number_input("Slot", value=1, min_value=0, max_value=31, disabled=not v33,
-                                     help="S7-1200/1500 = 1，S7-300 = 2")
+            t_rack = r1.number_input(
+                "Rack", value=0, min_value=0, max_value=7, disabled=not v33
+            )
+            t_slot = r2.number_input(
+                "Slot",
+                value=1,
+                min_value=0,
+                max_value=31,
+                disabled=not v33,
+                help="S7-1200/1500 = 1，S7-300 = 2",
+            )
             t_sensor_label = st.selectbox(
                 "綁定感測器 (sensor_code，可留空)",
                 tia_free_options,
@@ -260,9 +323,13 @@ def render():
                     t_db_number = parsed["db"]
                 if parsed["width"] == 0:
                     t_data_type = "BOOL"
-                st.caption(f"↳ 區域 {t_area}" + (f"、DB{t_db_number}" if t_area == "DB" else "")
-                           + f"、byte {t_offset}" + (f"、bit {t_bit}" if t_data_type == "BOOL" else "")
-                           + f"、型態 {t_data_type}")
+                st.caption(
+                    f"↳ 區域 {t_area}"
+                    + (f"、DB{t_db_number}" if t_area == "DB" else "")
+                    + f"、byte {t_offset}"
+                    + (f"、bit {t_bit}" if t_data_type == "BOOL" else "")
+                    + f"、型態 {t_data_type}"
+                )
             except ValueError as e:
                 st.error(str(e))
                 test_tia = submit_tia = False
@@ -273,7 +340,14 @@ def render():
         if test_tia:
             with st.spinner("📡 正在連線 Siemens PLC 並嘗試讀取 DB 數據..."):
                 ok, msg = test_tia_read(
-                    t_plc_ip, t_db_number, t_offset, t_data_type, t_rack, t_slot, t_area, t_bit
+                    t_plc_ip,
+                    t_db_number,
+                    t_offset,
+                    t_data_type,
+                    t_rack,
+                    t_slot,
+                    t_area,
+                    t_bit,
                 )
                 if ok:
                     st.success(msg)
@@ -302,13 +376,35 @@ def render():
                 else:
                     with DatabaseConnector.get_connection() as conn:
                         with conn.cursor() as cur:
-                            cols = ["name", "plc_name", "plc_ip", "db_number", '"offset"', "data_type",
-                                    "sensor_id", "plc_state"]
-                            vals = [t_name, t_plc_name, t_plc_ip, int(t_db_number) if t_area == "DB" else 0,
-                                    int(t_offset), t_data_type, new_sensor_id, "OFFLINE"]
+                            cols = [
+                                "name",
+                                "plc_name",
+                                "plc_ip",
+                                "db_number",
+                                '"offset"',
+                                "data_type",
+                                "sensor_id",
+                                "plc_state",
+                            ]
+                            vals = [
+                                t_name,
+                                t_plc_name,
+                                t_plc_ip,
+                                int(t_db_number) if t_area == "DB" else 0,
+                                int(t_offset),
+                                t_data_type,
+                                new_sensor_id,
+                                "OFFLINE",
+                            ]
                             if v33:
                                 cols += ["area", "bit_offset", "rack", "slot", "unit"]
-                                vals += [t_area, int(t_bit), int(t_rack), int(t_slot), t_unit.strip() or None]
+                                vals += [
+                                    t_area,
+                                    int(t_bit),
+                                    int(t_rack),
+                                    int(t_slot),
+                                    t_unit.strip() or None,
+                                ]
                             cur.execute(
                                 f"INSERT INTO tia_scada ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))});",
                                 vals,
@@ -325,19 +421,35 @@ def render():
 
 def _render_poll_stats():
     svc = get_service_status()
-    stats = ((svc or {}).get("info") or {}).get("s7") if svc and svc.get("exists") else None
+    stats = (
+        ((svc or {}).get("info") or {}).get("s7") if svc and svc.get("exists") else None
+    )
     if not stats:
         return
-    rows = [{
-        "PLC": label,
-        "狀態": {"ONLINE": "🟢 正常", "PARTIAL": "🟡 部分失敗", "OFFLINE": "🔴 離線"}.get(v.get("state"), v.get("state")),
-        "點位（成功/總數）": f"{v.get('ok_tags', 0)} / {v.get('tags', 0)}",
-        "區塊數": v.get("blocks"), "請求數": v.get("requests"), "耗時 ms": v.get("last_cycle_ms"),
-        "單獨讀取的點位": v.get("isolated_tags"), "最後錯誤": v.get("last_error") or "",
-    } for label, v in stats.items()]
-    with st.expander(f"📈 採集狀況（每台 PLC，最後回報 {fmt_age(svc['age_seconds'])}）"):
-        st.caption("同一個 DB / 區域裡位址相近的點位合併成一次讀取。「單獨讀取的點位」是曾讓整塊讀取失敗的點位，"
-                   "建議用 S7 線上調適確認 offset 與 DB 長度。")
+    rows = [
+        {
+            "PLC": label,
+            "狀態": {
+                "ONLINE": "🟢 正常",
+                "PARTIAL": "🟡 部分失敗",
+                "OFFLINE": "🔴 離線",
+            }.get(v.get("state"), v.get("state")),
+            "點位（成功/總數）": f"{v.get('ok_tags', 0)} / {v.get('tags', 0)}",
+            "區塊數": v.get("blocks"),
+            "請求數": v.get("requests"),
+            "耗時 ms": v.get("last_cycle_ms"),
+            "單獨讀取的點位": v.get("isolated_tags"),
+            "最後錯誤": v.get("last_error") or "",
+        }
+        for label, v in stats.items()
+    ]
+    with st.expander(
+        f"📈 採集狀況（每台 PLC，最後回報 {fmt_age(svc['age_seconds'])}）"
+    ):
+        st.caption(
+            "同一個 DB / 區域裡位址相近的點位合併成一次讀取。「單獨讀取的點位」是曾讓整塊讀取失敗的點位，"
+            "建議用 S7 線上調適確認 offset 與 DB 長度。"
+        )
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 
@@ -346,13 +458,31 @@ def _render_delete(df_tia: pd.DataFrame):
         return
     st.divider()
     with st.expander("🗑️ 刪除點位"):
-        labels = {int(r["id"]): f"#{int(r['id'])} {r['name']}（{r['plc_ip']} DB{r['db_number']} @ {r['offset']}）"
-                  for _, r in df_tia.iterrows()}
-        chosen = st.multiselect("選擇要刪除的點位", list(labels), format_func=labels.get, key="tia_del")
-        st.caption("只刪除點位設定；感測器的歷史資料會保留。只是暫停採集的話取消「採集」勾選即可。")
-        confirm = st.checkbox(f"我確定要刪除這 {len(chosen)} 個點位", key="tia_del_ok", disabled=not chosen)
+        labels = {
+            int(
+                r["id"]
+            ): f"#{int(r['id'])} {r['name']}（{r['plc_ip']} DB{r['db_number']} @ {r['offset']}）"
+            for _, r in df_tia.iterrows()
+        }
+        chosen = st.multiselect(
+            "選擇要刪除的點位", list(labels), format_func=labels.get, key="tia_del"
+        )
+        st.caption(
+            "只刪除點位設定；感測器的歷史資料會保留。只是暫停採集的話取消「採集」勾選即可。"
+        )
+        confirm = st.checkbox(
+            f"我確定要刪除這 {len(chosen)} 個點位",
+            key="tia_del_ok",
+            disabled=not chosen,
+        )
         if st.button("刪除", disabled=not (chosen and confirm), key="tia_del_btn"):
-            n = execute("DELETE FROM tia_scada WHERE id = ANY(%s);", ([int(i) for i in chosen],))
-            audit_ui("tia.delete", "tia_scada", {"ids": chosen, "names": [labels[i] for i in chosen]})
+            n = execute(
+                "DELETE FROM tia_scada WHERE id = ANY(%s);", ([int(i) for i in chosen],)
+            )
+            audit_ui(
+                "tia.delete",
+                "tia_scada",
+                {"ids": chosen, "names": [labels[i] for i in chosen]},
+            )
             st.success(f"✅ 已刪除 {n} 個點位")
             st.rerun()

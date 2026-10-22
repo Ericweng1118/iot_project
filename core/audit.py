@@ -35,12 +35,15 @@ def audit(username: str, action: str, target: str | None = None, detail=None) ->
                         action,
                         target,
                         json.dumps(detail, ensure_ascii=False, default=str)
-                        if detail is not None else None,
+                        if detail is not None
+                        else None,
                     ),
                 )
         return True
     except Exception as e:
         if not _warned:
-            logger.warning(f"⚠️ 寫入 audit_log 失敗（尚未執行 sql/012？），之後的失敗不再重複提示: {e}")
+            logger.warning(
+                f"⚠️ 寫入 audit_log 失敗（尚未執行 sql/012？），之後的失敗不再重複提示: {e}"
+            )
             _warned = True
         return False

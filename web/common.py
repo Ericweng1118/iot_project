@@ -30,7 +30,10 @@ SERVICE_STALE_SECONDS = 60
 # ------------------------------------------------------------------
 def current_user() -> dict:
     return st.session_state.get("user") or {
-        "username": "unknown", "display_name": "unknown", "role": "viewer", "source": "none",
+        "username": "unknown",
+        "display_name": "unknown",
+        "role": "viewer",
+        "source": "none",
     }
 
 
@@ -111,7 +114,8 @@ def get_service_status(service_name: str = "collector") -> dict | None:
     df = fetch_df(
         "SELECT *, EXTRACT(EPOCH FROM now() - last_heartbeat) AS age_seconds "
         "FROM service_status WHERE service_name = %s;",
-        (service_name,), show_error=False,
+        (service_name,),
+        show_error=False,
     )
     if df.empty:
         return {"exists": False}
@@ -121,8 +125,12 @@ def get_service_status(service_name: str = "collector") -> dict | None:
         info = json.loads(info)
     row["info"] = info
     row["exists"] = True
-    row["age_seconds"] = float(row["age_seconds"]) if row["age_seconds"] is not None else None
-    row["alive"] = row["age_seconds"] is not None and row["age_seconds"] <= SERVICE_STALE_SECONDS
+    row["age_seconds"] = (
+        float(row["age_seconds"]) if row["age_seconds"] is not None else None
+    )
+    row["alive"] = (
+        row["age_seconds"] is not None and row["age_seconds"] <= SERVICE_STALE_SECONDS
+    )
     row["stopped_normally"] = bool(info.get("stopped_at")) and not row["alive"]
     return row
 
@@ -176,7 +184,11 @@ def sensor_catalog() -> pd.DataFrame:
         return df
 
     def _label(r):
-        text = f"{r['device_code']} / {r['sensor_code']}" if pd.notnull(r["device_code"]) else r["sensor_code"]
+        text = (
+            f"{r['device_code']} / {r['sensor_code']}"
+            if pd.notnull(r["device_code"])
+            else r["sensor_code"]
+        )
         if pd.notnull(r["nickname"]) and str(r["nickname"]).strip():
             text += f"（{r['nickname']}）"
         if pd.notnull(r["unit"]) and str(r["unit"]).strip():
@@ -255,11 +267,17 @@ def _normalize_state_dict(raw):
         try:
             parsed = ast.literal_eval(s)
             if isinstance(parsed, dict):
-                return (json.dumps(parsed, ensure_ascii=False), None) if parsed else (None, None)
+                return (
+                    (json.dumps(parsed, ensure_ascii=False), None)
+                    if parsed
+                    else (None, None)
+                )
         except (ValueError, SyntaxError):
             pass
         return None, f"無法解析為合法 JSON 或字典：{s}"
     return None, f"不支援的型態：{type(raw).__name__}"
+
+
 # ------------------------------------------------------------------
 # Helper 3: OPC UA 相關工具函式
 # ------------------------------------------------------------------
@@ -343,9 +361,7 @@ def _load_sensor_binding_map():
         )
         for _, r in df.iterrows():
             sid = int(r["sensor_id"])
-            mapping.setdefault(sid, []).append(
-                (table, int(r["pid"]), str(r["pname"]))
-            )
+            mapping.setdefault(sid, []).append((table, int(r["pid"]), str(r["pname"])))
     return mapping
 
 
@@ -422,8 +438,6 @@ def request_opcua_resubscribe(server_id: int):
         st.warning(f"⚠️ 通知訂閱服務重新整理失敗（不影響本次寫入結果）: {e}")
 
 
-
-
 # ------------------------------------------------------------------
 # 稽核用：比對表格編輯前後的差異
 # ------------------------------------------------------------------
@@ -444,7 +458,9 @@ def _same(a, b) -> bool:
         return str(a) == str(b)
 
 
-def frame_changes(before: pd.DataFrame, after: pd.DataFrame, id_col: str, limit: int = 200) -> dict:
+def frame_changes(
+    before: pd.DataFrame, after: pd.DataFrame, id_col: str, limit: int = 200
+) -> dict:
     """
     回傳 {列 id: {欄位: [舊值, 新值]}}，只列出真的有改的欄位，寫進 audit_log。
     欄位名稱含 password 的一律遮蔽，不把密碼寫進稽核紀錄。
@@ -467,7 +483,10 @@ def frame_changes(before: pd.DataFrame, after: pd.DataFrame, id_col: str, limit:
             if "password" in str(col).lower():
                 diffs[col] = ["***", "***（已變更）"]
             else:
-                diffs[col] = [None if _is_null(old) else old, None if _is_null(new) else new]
+                diffs[col] = [
+                    None if _is_null(old) else old,
+                    None if _is_null(new) else new,
+                ]
         if diffs:
             changes[str(rid)] = diffs
             if len(changes) >= limit:
@@ -482,11 +501,15 @@ def attach_sensor_ids(changes: dict, df: pd.DataFrame, id_col: str = "id") -> di
     modbus_scada / tia_scada 的列 id 是點位 id，PME 讀 audit_log 偵測倍率、data_type 變更時
     要知道影響哪個計量點，又不該為此開放讀這兩張表（約定見 docs/PME_INTERFACE.md）。
     """
-    if not isinstance(changes, dict) or "sensor_id" not in df.columns or id_col not in df.columns:
+    if (
+        not isinstance(changes, dict)
+        or "sensor_id" not in df.columns
+        or id_col not in df.columns
+    ):
         return changes
     lookup = {str(k): v for k, v in zip(df[id_col], df["sensor_id"])}
     for rid, diffs in changes.items():
-        if isinstance(diffs, dict):   # 跳過 _truncated / note 這類非列資料
+        if isinstance(diffs, dict):  # 跳過 _truncated / note 這類非列資料
             sid = lookup.get(rid)
             diffs["sensor_id"] = None if _is_null(sid) else int(sid)
     return changes
