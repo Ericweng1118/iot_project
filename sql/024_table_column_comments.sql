@@ -283,7 +283,7 @@ COMMENT ON COLUMN public.app_users.last_login IS '最後一次成功登入時間
 COMMENT ON TABLE public.audit_log IS
     '操作稽核紀錄：誰、什麼時間、做了什麼、改了哪個對象（寫入端 core/audit.py，只新增不修改）。'
     '網頁設定變更、登入 / 登出、警報確認都會寫；採集主程式以 username = system 寫系統事件（如 spool.drained）。'
-    'PME 共用此表：PME 寫入的 action 一律以 ems. 為前綴，並讀取 SCADA 的 spool.drained / 設定變更事件觸發重算'
+    'PME 共用此表：PME 寫入的 action 一律以 ems. 為前綴，並讀取 SCADA 的 spool.drained（自動重算）與設定變更事件（只標示）'
     '（docs/PME_INTERFACE.md）。';
 COMMENT ON COLUMN public.audit_log.id IS '稽核紀錄主鍵（流水號，自動產生）';
 COMMENT ON COLUMN public.audit_log.ts IS '事件發生時間（預設 now()）；設定變更事件的 ts 即設定生效時間（採集程式下次重載後才套用）';
@@ -325,7 +325,7 @@ COMMENT ON COLUMN public.device_templates.updated_at IS '最後修改時間（�
 COMMENT ON TABLE public.calculated_points IS
     '計算點：以運算式從其他感測器的即時值算出新感測器的值。'
     '結果寫進 sensor_id 指向的一般感測器（sensor_readings），與實體點位無差別。'
-    'PME 依賴此表（唯讀）：用它辨識計算點，能源加總時自行排除以免重複計算；欄位變更前須先通知 PME。';
+    'PME 依賴此表（唯讀）：自動判斷計量點時不納入計算點；已手動設為計量點的保留（例 829 / 830 熱量）；欄位變更前須先通知 PME。';
 COMMENT ON COLUMN public.calculated_points.calc_id IS '計算點主鍵（流水號，自動產生）';
 COMMENT ON COLUMN public.calculated_points.sensor_id IS
     '結果感測器，對應 sensors.sensor_id（FK，UNIQUE：一個感測器只能是一個計算點的結果；感測器刪除時計算點一併刪除）。此感測器不應再綁定實體點位。';
