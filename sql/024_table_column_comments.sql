@@ -404,4 +404,31 @@ BEGIN
     END LOOP;
 END $$;
 
+-- ------------------------------------------------------------
+-- 19. 正式庫補漏
+--     tia_scada / opcua_tags 的表註解在 000 已有，但正式庫的表比 000 早建，沒套到，這裡重下一次（同文字）。
+--     sensor_readings_translated 是正式庫既有的 view（不在 sql/ 內，見 web/pages/config_hierarchy.py 說明），
+--     用 DO 區塊檢查存在才加註解，新環境沒有這個 view 時略過。
+-- ------------------------------------------------------------
+COMMENT ON TABLE public.tia_scada  IS '即時層：西門子 S7 (TIA) 點位設定與最新值';
+COMMENT ON TABLE public.opcua_tags IS '即時層：OPC UA 瀏覽出來的點位與最新值';
+
+DO $$
+BEGIN
+    IF to_regclass('public.sensor_readings_translated') IS NOT NULL THEN
+        COMMENT ON VIEW public.sensor_readings_translated IS
+            '把 sensor_readings 的數值依 sensors.state_dictionary 翻譯成狀態文字（例如 0→停機、1→運轉），'
+            '沒有對應字典時顯示原值；給 Grafana / 人工查詢用，不寫入。';
+        COMMENT ON COLUMN public.sensor_readings_translated.reading_id    IS '來源 sensor_readings.reading_id';
+        COMMENT ON COLUMN public.sensor_readings_translated.sensor_id     IS '感測器 ID（sensors.sensor_id）';
+        COMMENT ON COLUMN public.sensor_readings_translated.sensor_code   IS '感測器代碼（sensors.sensor_code）';
+        COMMENT ON COLUMN public.sensor_readings_translated.nickname      IS '感測器暱稱（sensors.nickname）';
+        COMMENT ON COLUMN public.sensor_readings_translated.reading_time  IS '讀值時間（sensor_readings.reading_time）';
+        COMMENT ON COLUMN public.sensor_readings_translated.raw_value     IS '原始數值（sensor_readings.value，工程單位）';
+        COMMENT ON COLUMN public.sensor_readings_translated.display_value IS '顯示文字：數值四捨五入成整數後查 state_dictionary，查無則為原值字串';
+    ELSE
+        RAISE NOTICE 'view sensor_readings_translated 不存在，略過註解';
+    END IF;
+END $$;
+
 COMMIT;
