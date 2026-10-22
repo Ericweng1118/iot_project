@@ -26,6 +26,8 @@
 | `023_pme_app_users_grant.sql` | 🆕 授權 PME 的 `pme` 帳號對 `app_users` 欄位層級 INSERT / UPDATE（不含 DELETE），供 PME 使用者管理頁使用。**前提：PME 的 `005_pme_role.sql` 已建立 `pme` 角色**（不存在會略過）。用 `-v pme_user=` 指定帳號 | 啟用 PME 使用者管理時，由 Eric 以擁有者身分執行 |
 | `023_rollback.sql` | 回滾 023，收回 `pme` 對 `app_users` 的 INSERT / UPDATE（**不是** migration） | ❌ 不要放進批次執行 |
 | `024_table_column_comments.sql` | 🆕 補齊 000～023 漏掉的表、欄位、索引 `COMMENT ON`（中文用途、單位、來源；共用表註明 PME 依賴）。只有註解，不動結構與資料，可重複執行 | 擁有者執行一次即可 |
+| `025_revoke_scada_ems.sql` | 🆕 PME 改用 `pme` 帳號觀察一週後（2026-10-26 起），收回 `scada` 在 `ems` 的過渡期權限與兩條 pme→scada 預設權限（**不是** migration） | ❌ 不要放進批次；Eric 決定後手動執行一次 |
+| `025_rollback.sql` | 回滾 025，恢復 `scada` 在 `ems` 的權限（同 PME `005` 第 2 段） | ❌ 不要放進批次執行 |
 | `013_timeseries_policy.sql` | 🆕 **選用**：`sensor_readings` 啟用 TimescaleDB 壓縮（超過 30 天的 chunk 自動壓縮，不刪資料）。資料保留政策只寫在註解裡，需要時手動執行 | 確認後再跑，建議離峰時段 |
 
 ```bash
